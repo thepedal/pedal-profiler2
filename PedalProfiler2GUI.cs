@@ -67,6 +67,11 @@ namespace WDE.PedalProfiler2
                     _subscribedBuzz.Song.MachineRemoved += OnMachineRemoved;
                 }
 
+                // Pre-seed selection from persisted state BEFORE populating
+                // the combo. RefreshMachineList will pick this up if the name
+                // is in the song; otherwise it falls back to index 0.
+                _selectedName = _machine?.PersistedSelection;
+
                 RefreshMachineList();
             }
         }
@@ -174,6 +179,9 @@ namespace WDE.PedalProfiler2
         WrapPanel  _downstreamPanel = null!;
 
         TextBlock   _spikeAttribText = null!;
+        Button      _spikeListToggleBtn = null!;
+        StackPanel  _spikeListPanel     = null!;
+        bool        _spikeListExpanded  = false;
 
         StackPanel  _paramListPanel  = null!;
 
@@ -439,9 +447,39 @@ namespace WDE.PedalProfiler2
                 FontFamily   = Mono,
                 FontSize     = 11,
                 TextWrapping = TextWrapping.Wrap,
-                Margin       = new Thickness(0, 0, 0, 10)
+                Margin       = new Thickness(0, 0, 0, 2)
             };
             root.Children.Add(_spikeAttribText);
+
+            // Expand/collapse toggle for the spike list. Collapsed by default —
+            // most users only need the summary count above.
+            _spikeListToggleBtn = new Button
+            {
+                Content      = "▶ show spike list",
+                Background   = Brushes.Transparent,
+                BorderBrush  = Brushes.Transparent,
+                Foreground   = BrushSubText,
+                FontFamily   = Mono,
+                FontSize     = 10,
+                HorizontalAlignment = HorizontalAlignment.Left,
+                Padding      = new Thickness(0, 0, 0, 0),
+                Cursor       = Cursors.Hand
+            };
+            _spikeListToggleBtn.Click += (_, __) =>
+            {
+                _spikeListExpanded = !_spikeListExpanded;
+                _spikeListToggleBtn.Content = _spikeListExpanded ? "▼ hide spike list" : "▶ show spike list";
+                _spikeListPanel.Visibility = _spikeListExpanded ? Visibility.Visible : Visibility.Collapsed;
+                if (_spikeListExpanded) RefreshSpikeList();
+            };
+            root.Children.Add(_spikeListToggleBtn);
+
+            _spikeListPanel = new StackPanel
+            {
+                Visibility = Visibility.Collapsed,
+                Margin     = new Thickness(0, 2, 0, 10)
+            };
+            root.Children.Add(_spikeListPanel);
 
             // ── Parameters ───────────────────────────────────────────────────
             root.Children.Add(SectionHeader("Parameters"));
@@ -488,6 +526,28 @@ namespace WDE.PedalProfiler2
 
             _profileAllResultsPanel = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
             root.Children.Add(_profileAllResultsPanel);
+
+            // ── Diagnostics ──────────────────────────────────────────────────
+            // Reflection-dump button: walks Global.Buzz, the selected machine's
+            // MachineCore, and a parameter's ParameterCore via reflection and
+            // writes everything to the DC console. Maps the actual reachable
+            // surface of ReBuzz internals so we can pick which fields are worth
+            // exposing properly (e.g. per-machine Work() timing if it exists).
+            root.Children.Add(SectionHeader("Diagnostics"));
+            var diagRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+            var dumpBtn = MakeButton("Dump Internals (DC)", 150);
+            dumpBtn.Click += (_, __) => DumpInternalsToDC();
+            diagRow.Children.Add(dumpBtn);
+            diagRow.Children.Add(new TextBlock
+            {
+                Text       = "writes to ReBuzz Debug Console",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin     = new Thickness(8, 0, 0, 0)
+            });
+            root.Children.Add(diagRow);
 
             // ── Global status footer ─────────────────────────────────────────
             root.Children.Add(new Border
@@ -591,6 +651,10 @@ namespace WDE.PedalProfiler2
                 try { _selectedIMachine = _subscribedBuzz.Song.Machines.FirstOrDefault(m => m.Name == name); }
                 catch { }
             }
+
+            // Persist back to the machine — gets serialized into the song
+            // file on next save via MachineState getter.
+            if (_machine != null) _machine.PersistedSelection = name;
 
             // Reset per-selection state
             _machineCostIdx        = 0;
@@ -1035,6 +1099,7 @@ namespace WDE.PedalProfiler2
             {
                 _spikeAttribText.Text       = "(no spikes captured yet)";
                 _spikeAttribText.Foreground = BrushSubText;
+                if (_spikeListExpanded) RefreshSpikeList();
                 return;
             }
 
@@ -1060,6 +1125,88 @@ namespace WDE.PedalProfiler2
                 _spikeAttribText.Foreground = pct >= 80 ? BrushBad
                                             : pct >= 40 ? BrushWarn
                                             : BrushOk;
+            }
+
+            if (_spikeListExpanded) RefreshSpikeList();
+        }
+
+        // ─── Spike list — one row per captured spike, with timestamp + actives ─
+        void RefreshSpikeList()
+        {
+            _spikeListPanel.Children.Clear();
+            var snap = _machine?.Snapshot;
+            if (snap?.Spikes == null || snap.Spikes.Length == 0)
+            {
+                _spikeListPanel.Children.Add(MakePlaceholder("(no spikes captured)"));
+                return;
+            }
+
+            // Header row — column labels
+            _spikeListPanel.Children.Add(new TextBlock
+            {
+                Text       = "  time     bpm   spike   active machines",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 9,
+                Margin     = new Thickness(0, 0, 0, 2)
+            });
+
+            foreach (var sp in snap.Spikes)
+            {
+                // "+M:SS.s" time format
+                double elapsed = sp.ElapsedSec;
+                int minutes = (int)(elapsed / 60.0);
+                double secs = elapsed - minutes * 60.0;
+                string timeStr = $"+{minutes}:{secs:00.0}";
+
+                // Render active-machines list with the selected name highlighted
+                var inline = new TextBlock
+                {
+                    FontFamily   = Mono,
+                    FontSize     = 10,
+                    TextWrapping = TextWrapping.Wrap,
+                    Margin       = new Thickness(0, 1, 0, 1)
+                };
+
+                // Fixed-width prefix: time, bpm, spike-ms
+                inline.Inlines.Add(new System.Windows.Documents.Run
+                {
+                    Text       = $"  {timeStr,-8} {sp.Bpm,3}   {sp.SpikeMs,5:F2}   ",
+                    Foreground = BrushText
+                });
+
+                bool selfInThis = false;
+                if (sp.ActiveMachines != null && sp.ActiveMachines.Length > 0)
+                {
+                    for (int i = 0; i < sp.ActiveMachines.Length; i++)
+                    {
+                        var nm = sp.ActiveMachines[i];
+                        bool isSelected = (nm == _selectedName);
+                        if (isSelected) selfInThis = true;
+                        inline.Inlines.Add(new System.Windows.Documents.Run
+                        {
+                            Text       = (i > 0 ? ", " : "") + nm,
+                            Foreground = isSelected ? BrushBad : BrushText,
+                            FontWeight = isSelected ? FontWeights.Bold : FontWeights.Normal
+                        });
+                    }
+                }
+                else
+                {
+                    inline.Inlines.Add(new System.Windows.Documents.Run
+                    {
+                        Text       = "(no attribution data)",
+                        Foreground = BrushSubText
+                    });
+                }
+
+                // Subtle background tint when the selected machine was active
+                _spikeListPanel.Children.Add(new Border
+                {
+                    Background = selfInThis ? BrushTrack : Brushes.Transparent,
+                    Padding    = new Thickness(2, 0, 2, 0),
+                    Child      = inline
+                });
             }
         }
 
@@ -1633,6 +1780,181 @@ namespace WDE.PedalProfiler2
                 };
                 _profileAllResultsPanel.Children.Add(btn);
             }
+        }
+
+
+        // ═════════════════════════════════════════════════════════════════════
+        // Reflection-dump diagnostic
+        // ═════════════════════════════════════════════════════════════════════
+        // Empirical map of what's reachable on ReBuzz internals. Walks:
+        //   - IBuzz (Global.Buzz) — engine root
+        //   - Selected IMachine cast to its concrete MachineCore type
+        //   - One of the selected machine's IParameters cast to ParameterCore
+        //   - The Snapshot from this Profiler2Machine instance (sanity check)
+        //
+        // Output via DCWriteLine, one line per call (it doesn't handle
+        // multi-line strings — see Tracker §7.5). View in ReBuzz under the
+        // Debug Console window.
+        //
+        // No engine state is modified. Read-only inspection.
+        void DumpInternalsToDC()
+        {
+            var buzz = _subscribedBuzz;
+            if (buzz == null) return;
+
+            void Line(string s)
+            {
+                try { buzz.DCWriteLine(s); } catch { }
+            }
+
+            Line("");
+            Line("════════════════════════════════════════════════════════════");
+            Line("Pedal Profiler2 — reflection dump  " + DateTime.Now.ToString("HH:mm:ss"));
+            Line("════════════════════════════════════════════════════════════");
+
+            DumpObject(buzz,                "IBuzz (Global.Buzz)",                 Line, maxDepth: 1);
+            DumpObject(buzz.Song,           "IBuzz.Song",                          Line, maxDepth: 1);
+
+            if (_selectedIMachine != null)
+            {
+                DumpObject(_selectedIMachine, $"IMachine '{_selectedIMachine.Name}'", Line, maxDepth: 1);
+
+                // First parameter of group 1 (globals), if any
+                try
+                {
+                    var groups = _selectedIMachine.ParameterGroups;
+                    if (groups != null && groups.Count >= 2 && groups[1].Parameters.Count > 0)
+                    {
+                        var p = groups[1].Parameters[0];
+                        DumpObject(p, $"IParameter '{p.Name}'", Line, maxDepth: 1);
+                    }
+                } catch { }
+            }
+
+            if (_machine != null)
+            {
+                DumpObject(_machine.Snapshot, "Profile2Snapshot (this v2 instance)", Line, maxDepth: 1);
+            }
+
+            Line("════════════════════════════════════════════════════════════");
+            Line("end reflection dump");
+            Line("");
+
+            // Open the debug console so the user sees the output without hunting
+            try
+            {
+                System.Windows.Application.Current?.Dispatcher?.BeginInvoke(
+                    (Action)(() => { try { buzz.ExecuteCommand(BuzzCommand.DebugConsole); } catch { } }));
+            } catch { }
+        }
+
+        // Walk a single object: print its concrete type, then all public +
+        // non-public instance properties & fields, dispatching by "interesting"
+        // type. Stops at depth 0 for object-typed children (just notes their
+        // type + a short preview) to keep output bounded.
+        static void DumpObject(object? obj, string label, Action<string> Line, int maxDepth)
+        {
+            Line("");
+            Line("── " + label + " ──");
+            if (obj == null) { Line("  (null)"); return; }
+
+            var t = obj.GetType();
+            Line("  runtime type: " + t.FullName);
+            Line("  assembly:     " + (t.Assembly?.GetName().Name ?? "?"));
+
+            const System.Reflection.BindingFlags FLAGS =
+                System.Reflection.BindingFlags.Public    |
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Instance;
+
+            // Properties first — usually the documented surface
+            System.Reflection.PropertyInfo[] props;
+            try { props = t.GetProperties(FLAGS); } catch { props = Array.Empty<System.Reflection.PropertyInfo>(); }
+            Line($"  properties ({props.Length}):");
+            foreach (var p in props.OrderBy(p => p.Name))
+            {
+                string val = "?";
+                try
+                {
+                    if (p.GetIndexParameters().Length > 0) { val = "[indexer]"; }
+                    else
+                    {
+                        var v = p.GetValue(obj);
+                        val = FormatValue(v, maxDepth);
+                    }
+                }
+                catch (Exception ex) { val = "<" + ex.GetType().Name + ">"; }
+                Line($"    {p.Name,-32}  {ShortType(p.PropertyType),-26}  = {val}");
+            }
+
+            // Fields — where most "interesting" engine state lives
+            System.Reflection.FieldInfo[] fields;
+            try { fields = t.GetFields(FLAGS); } catch { fields = Array.Empty<System.Reflection.FieldInfo>(); }
+            Line($"  fields ({fields.Length}):");
+            foreach (var f in fields.OrderBy(f => f.Name))
+            {
+                string val = "?";
+                try { val = FormatValue(f.GetValue(obj), maxDepth); }
+                catch (Exception ex) { val = "<" + ex.GetType().Name + ">"; }
+                Line($"    {f.Name,-32}  {ShortType(f.FieldType),-26}  = {val}");
+            }
+        }
+
+        static string ShortType(Type t)
+        {
+            if (t == null) return "?";
+            // Strip namespaces but keep generics visible
+            string n = t.Name;
+            if (t.IsGenericType)
+            {
+                var args = string.Join(",", t.GetGenericArguments().Select(a => a.Name));
+                int tick = n.IndexOf('`');
+                if (tick >= 0) n = n.Substring(0, tick);
+                n = $"{n}<{args}>";
+            }
+            return n;
+        }
+
+        static string FormatValue(object? v, int maxDepth)
+        {
+            if (v == null) return "null";
+            var t = v.GetType();
+            // Primitives, strings, decimals, enums — print directly
+            if (t.IsPrimitive || t.IsEnum || v is string || v is decimal || v is DateTime || v is TimeSpan)
+            {
+                string s = v.ToString() ?? "";
+                if (s.Length > 80) s = s.Substring(0, 77) + "...";
+                return v is string ? "\"" + s + "\"" : s;
+            }
+            // Collections — show count + first few
+            if (v is System.Collections.IEnumerable enumerable && !(v is string))
+            {
+                int count = 0;
+                var preview = new System.Text.StringBuilder();
+                preview.Append("[");
+                foreach (var item in enumerable)
+                {
+                    if (count > 0) preview.Append(", ");
+                    if (count < 4) preview.Append(FormatValue(item, 0));
+                    count++;
+                    if (count > 4) { preview.Append("…"); break; }
+                }
+                preview.Append("] count≈").Append(count);
+                return preview.ToString();
+            }
+            // Complex objects at depth 0 — just print type + ToString preview
+            if (maxDepth <= 0)
+            {
+                string s = ShortType(t);
+                try
+                {
+                    string ts = v.ToString() ?? "";
+                    if (ts != t.FullName && ts.Length > 0 && ts.Length < 60) s += " {" + ts + "}";
+                }
+                catch { }
+                return s;
+            }
+            return ShortType(t);
         }
     }
 }

@@ -31,6 +31,8 @@ using System;
 using Buzz.MachineInterface;
 using BuzzGUI.Interfaces;
 using System.Diagnostics;
+using System.IO;
+using System.Text;
 
 namespace WDE.PedalProfiler2
 {
@@ -145,6 +147,71 @@ namespace WDE.PedalProfiler2
         {
             _host = host;
             _loadTimestamp = Stopwatch.GetTimestamp();
+        }
+
+
+        // ─── MachineState persistence (per IBuzzMachine.cs:28) ───────────────
+        // ReBuzz serializes byte[] returned from MachineState getter into the
+        // song file. On load, calls setter with the deserialized bytes BEFORE
+        // creating the GUI. The GUI reads PersistedSelection in its Machine
+        // setter to restore selection across song load/save.
+        //
+        // Format:
+        //   bytes 0..3   : magic "PP2S" (Pedal Profiler2 State)
+        //   byte 4       : version (1)
+        //   bytes 5..6   : UInt16 length of selected-machine name in UTF-8
+        //   bytes 7..    : UTF-8 bytes of name (may be empty)
+        //
+        // Forward compatibility: unknown versions return empty state. Future
+        // fields appended after the name preserve back-compat by length-tag.
+
+        const uint  STATE_MAGIC   = 0x53325050u;  // "PP2S" little-endian
+        const byte  STATE_VERSION = 1;
+
+        // What the GUI writes when selection changes. Read on Machine setter
+        // to restore. UI-thread only — no audio-thread access.
+        public string? PersistedSelection { get; set; }
+
+        public byte[] MachineState
+        {
+            get
+            {
+                try
+                {
+                    using var ms = new MemoryStream();
+                    using var bw = new BinaryWriter(ms);
+                    bw.Write(STATE_MAGIC);
+                    bw.Write(STATE_VERSION);
+                    var nameBytes = string.IsNullOrEmpty(PersistedSelection)
+                        ? Array.Empty<byte>()
+                        : Encoding.UTF8.GetBytes(PersistedSelection!);
+                    if (nameBytes.Length > ushort.MaxValue)
+                        nameBytes = Array.Empty<byte>();  // defensive — names won't realistically be this long
+                    bw.Write((ushort)nameBytes.Length);
+                    bw.Write(nameBytes);
+                    return ms.ToArray();
+                }
+                catch { return Array.Empty<byte>(); }
+            }
+            set
+            {
+                if (value == null || value.Length < 7) return;  // too short to be ours
+                try
+                {
+                    using var ms = new MemoryStream(value);
+                    using var br = new BinaryReader(ms);
+                    uint magic = br.ReadUInt32();
+                    if (magic != STATE_MAGIC) return;            // not our format
+                    byte version = br.ReadByte();
+                    if (version != STATE_VERSION) return;        // future version — ignore
+                    ushort nameLen = br.ReadUInt16();
+                    if (nameLen == 0) { PersistedSelection = null; return; }
+                    if (nameLen > value.Length - 7) return;      // truncated
+                    var nameBytes = br.ReadBytes(nameLen);
+                    PersistedSelection = Encoding.UTF8.GetString(nameBytes);
+                }
+                catch { /* corrupt state — silently ignore, start fresh */ }
+            }
         }
 
 

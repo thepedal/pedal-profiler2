@@ -8,17 +8,18 @@ Companion to **Pedal Profiler** (v1, the global dashboard). Where v1 shows every
 
 A separate, resizable inspector window with:
 
-- **Machine selector** at the top (dropdown + prev/next buttons). Pick any machine in the song.
+- **Machine selector** at the top (dropdown + prev/next buttons). Pick any machine in the song. Selection persists across song save/load via `MachineState` — reopen the song and your last-inspected machine comes back.
 - **Buffer info line** at the top of the Cost panel: `Buffer: 5.33 ms (256 spl @ 48.0 kHz · 64-buf avg)`. This is the budget every cost number is measured against — every audio buffer must finish in this much wall-clock time or you drop samples.
 - **Cost panel** — two numbers, both in milliseconds per buffer with the percentage of buffer budget alongside:
   - **Solo** — what the selected machine costs *on its own* (everyone else muted briefly). A sub-line shows the peak single-buffer cost and the median of the last 5 solo readings, so you can see both the noise floor and the smoothed estimate.
   - **Marginal** — what muting the machine would *actually save* in the current mix. Can be triggered explicitly with the Measure Marginal button, or captured passively when you toggle the selected machine's mute manually.
 - **Sparkline** of the measured cost over time, alongside Measure Solo and Measure Marginal buttons.
 - **Connection map** — one-hop upstream and downstream neighbors as clickable chips. Click any neighbor to switch focus to it (navigation through the signal chain).
-- **Spike attribution** — for the last 8 captured xruns, how many of them were happening *while this machine was active*. A machine showing "active during 7 of last 8 spikes (87%)" is a strong suspect — combined with the solo cost (which tells you whether that "active during all spikes" is plausibly causal) it triangulates the culprit.
+- **Spike attribution** — for the last 8 captured xruns, how many of them were happening *while this machine was active*. A machine showing "active during 7 of last 8 spikes (87%)" is a strong suspect — combined with the solo cost (which tells you whether that "active during all spikes" is plausibly causal) it triangulates the culprit. **Expand the spike list** for per-spike detail: timestamp, BPM, spike duration, and which machines were active at that moment (selected machine highlighted in red, row tinted when present).
 - **Parameter table** — every global parameter with its current value and a "writes per second" rate. Rows flash when the value changes, so you can see what's being automated.
 - **Activity** — type tag (GEN / FX / CTRL) and track count.
 - **Profile All** button — cycles solo measurement across every non-control machine in the song, building a sorted bar chart. Bars scale against the buffer budget (not against the heaviest machine), so the visual proportions reflect actual CPU fraction and stay comparable across runs.
+- **Diagnostics — "Dump Internals (DC)" button** — walks `IBuzz`, the selected machine's `MachineCore`, and a parameter's `ParameterCore` via reflection and dumps every reachable public + non-public property and field to the ReBuzz Debug Console (which it also opens automatically). Useful for mapping what engine internals are accessible without touching live state — read-only, no modifications. Helps decide what's worth exposing in future iterations.
 - **Global status footer** — overall CPU %, dropouts, spikes, so you don't lose situational awareness while focused on one machine.
 
 ## Solo vs Marginal — which number do you want?
