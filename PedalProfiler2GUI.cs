@@ -12,6 +12,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
@@ -116,6 +117,142 @@ namespace WDE.PedalProfiler2
         long _lastParamPollTicks = 0;
 
 
+        // ─── Engine-reported per-machine cost (from MachinePerformanceData) ──
+        // ReBuzz internally tracks (PerformanceCount, SampleCount) per machine
+        // via PerformanceDataCurrent — both Int64, both cumulative. Reading the
+        // delta over a known time window gives us the machine's actual DSP cost
+        // with no muting, no measurement noise from window averaging, no
+        // perturbation of the audio thread.
+        //
+        // PerformanceCount appears to be in Stopwatch.Frequency ticks (i.e.
+        // QueryPerformanceCounter), so:
+        //
+        //   cpu_fraction = (delta_perf * sample_rate)
+        //                  ─────────────────────────────
+        //                  (delta_samp * QPC_frequency)
+        //
+        //   ms_per_buffer = cpu_fraction * budget_ms
+        //
+        // Reflection set up lazily — first read on a given machine resolves the
+        // PerformanceDataCurrent property + PerformanceCount/SampleCount fields
+        // and caches them per-type, so subsequent reads are direct.
+        class EnginePerfState
+        {
+            public long LastPerformanceCount;
+            public long LastSampleCount;
+            public long LastReadTickMs;
+            public bool HasPrior;
+            public double SmoothedMsPerBuffer = double.NaN;
+            public double SmoothedCpuPct      = double.NaN;
+        }
+        readonly Dictionary<string, EnginePerfState> _enginePerf = new();
+
+        // Type-level reflection cache. The performance objects are all of the
+        // same concrete type per ReBuzz session, so we resolve once.
+        System.Reflection.PropertyInfo? _perfDataCurrentProp;
+        System.Reflection.FieldInfo?    _perfCountField;
+        System.Reflection.FieldInfo?    _sampleCountField;
+        bool _enginePerfResolved;
+        bool _enginePerfAvailable;
+
+        (long perf, long samp)? ReadEnginePerfRaw(IMachine m)
+        {
+            if (_enginePerfResolved && !_enginePerfAvailable) return null;
+
+            try
+            {
+                if (_perfDataCurrentProp == null)
+                {
+                    _perfDataCurrentProp = m.GetType().GetProperty("PerformanceDataCurrent");
+                    if (_perfDataCurrentProp == null) { _enginePerfResolved = true; return null; }
+                }
+                var perfObj = _perfDataCurrentProp.GetValue(m);
+                if (perfObj == null) return null;  // some machines may not have data yet
+
+                if (_perfCountField == null || _sampleCountField == null)
+                {
+                    var t = perfObj.GetType();
+                    _perfCountField   = t.GetField("PerformanceCount");
+                    _sampleCountField = t.GetField("SampleCount");
+                    if (_perfCountField == null || _sampleCountField == null)
+                    {
+                        _enginePerfResolved = true;
+                        return null;
+                    }
+                }
+
+                long perf = (long)(_perfCountField.GetValue(perfObj) ?? 0L);
+                long samp = (long)(_sampleCountField.GetValue(perfObj) ?? 0L);
+                _enginePerfResolved = true;
+                _enginePerfAvailable = true;
+                return (perf, samp);
+            }
+            catch
+            {
+                _enginePerfResolved = true;
+                return null;
+            }
+        }
+
+        // Returns the smoothed (ms_per_buffer, cpu_pct) for the given machine,
+        // or null when no valid delta is available yet. Updates the per-machine
+        // EMA state as a side effect.
+        (double msPerBuffer, double cpuPct)? UpdateEngineCost(IMachine m, double budgetMs)
+        {
+            if (m == null || _machine == null) return null;
+            var raw = ReadEnginePerfRaw(m);
+            if (raw == null) return null;
+
+            int sampleRate = _machine.Snapshot?.SampleRate ?? 0;
+            if (sampleRate <= 0) return null;
+
+            string name = m.Name;
+            if (!_enginePerf.TryGetValue(name, out var st))
+            {
+                st = new EnginePerfState
+                {
+                    LastPerformanceCount = raw.Value.perf,
+                    LastSampleCount      = raw.Value.samp,
+                    LastReadTickMs       = Environment.TickCount64,
+                    HasPrior             = true
+                };
+                _enginePerf[name] = st;
+                return null;  // first sample — need two for a delta
+            }
+
+            long deltaPerf = raw.Value.perf - st.LastPerformanceCount;
+            long deltaSamp = raw.Value.samp - st.LastSampleCount;
+            st.LastPerformanceCount = raw.Value.perf;
+            st.LastSampleCount      = raw.Value.samp;
+            st.LastReadTickMs       = Environment.TickCount64;
+
+            if (deltaSamp <= 0 || deltaPerf < 0) return null;  // paused or counter reset
+
+            double qpcFreq = Stopwatch.Frequency;
+            if (qpcFreq <= 0) return null;
+
+            double cpuFraction = (deltaPerf * (double)sampleRate)
+                                 / (deltaSamp * qpcFreq);
+            double msPerBuffer = (budgetMs > 0) ? cpuFraction * budgetMs : double.NaN;
+            double cpuPct      = cpuFraction * 100.0;
+
+            // EMA smoothing — alpha 0.2 ≈ 1-second time constant at 100ms ticks
+            const double alpha = 0.2;
+            if (double.IsNaN(st.SmoothedMsPerBuffer))
+            {
+                st.SmoothedMsPerBuffer = msPerBuffer;
+                st.SmoothedCpuPct      = cpuPct;
+            }
+            else
+            {
+                st.SmoothedMsPerBuffer = st.SmoothedMsPerBuffer * (1 - alpha) + msPerBuffer * alpha;
+                st.SmoothedCpuPct      = st.SmoothedCpuPct      * (1 - alpha) + cpuPct      * alpha;
+            }
+
+            return (st.SmoothedMsPerBuffer, st.SmoothedCpuPct);
+        }
+
+
         // ─── Measurement state machine — handles both Solo & Marginal modes ──
         // Solo:     mute ALL OTHER non-control machines, settle, read AvgOtherMs.
         //           Result = cost of target running alone.
@@ -152,7 +289,6 @@ namespace WDE.PedalProfiler2
         List<string>?   _profileAllQueue;
         int             _profileAllIdx;
         readonly Dictionary<string, double> _profileAllResults = new();
-        DispatcherTimer? _profileAllTimer;
         double          _profileAllBudgetMs = double.NaN;  // captured at start, used for bar scaling
 
 
@@ -167,6 +303,8 @@ namespace WDE.PedalProfiler2
         TextBlock   _typeBadge       = null!;
 
         TextBlock   _periodInfoText  = null!;   // "Buffer: 5.33 ms (256 spl @ 48 kHz, 64-buf avg)"
+        TextBlock   _engineCostText  = null!;   // primary live engine-reported cost
+        TextBlock   _engineSubText   = null!;   // "live · MComp"
         TextBlock   _soloCostText    = null!;
         TextBlock   _soloSubText     = null!;   // "peak X.XX ms · median Y.YY ms"
         TextBlock   _marginalCostText= null!;
@@ -190,6 +328,7 @@ namespace WDE.PedalProfiler2
         TextBlock   _globalStatusText= null!;
 
         Button      _profileAllBtn   = null!;
+        Button      _profileAllEngineBtn = null!;
         TextBlock   _profileAllStatus= null!;
         StackPanel  _profileAllResultsPanel = null!;
 
@@ -243,7 +382,6 @@ namespace WDE.PedalProfiler2
                 _timer.Stop();
                 _measureTimer?.Stop();
                 _muteDeltaTimer?.Stop();
-                _profileAllTimer?.Stop();
 
                 if (_subscribedBuzz?.Song != null)
                 {
@@ -349,21 +487,34 @@ namespace WDE.PedalProfiler2
             var costGrid = new Grid { Margin = new Thickness(0, 0, 0, 2) };
             costGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             costGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            costGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
+            // ENGINE — primary live reading from MachinePerformanceData
+            var engineCol = new StackPanel();
+            engineCol.Children.Add(new TextBlock { Text = "ENGINE", Foreground = BrushSubText, FontFamily = Mono, FontSize = 9 });
+            _engineCostText = new TextBlock { Text = "—", Foreground = BrushAccent, FontFamily = Mono, FontSize = 14, FontWeight = FontWeights.Bold };
+            engineCol.Children.Add(_engineCostText);
+            _engineSubText = new TextBlock { Text = "", Foreground = BrushSubText, FontFamily = Mono, FontSize = 9 };
+            engineCol.Children.Add(_engineSubText);
+            Grid.SetColumn(engineCol, 0);
+            costGrid.Children.Add(engineCol);
+
+            // SOLO — snapshot via mute-all-others
             var soloCol = new StackPanel();
             soloCol.Children.Add(new TextBlock { Text = "SOLO", Foreground = BrushSubText, FontFamily = Mono, FontSize = 9 });
             _soloCostText = new TextBlock { Text = "—", Foreground = BrushAccent, FontFamily = Mono, FontSize = 14, FontWeight = FontWeights.Bold };
             soloCol.Children.Add(_soloCostText);
             _soloSubText = new TextBlock { Text = "", Foreground = BrushSubText, FontFamily = Mono, FontSize = 9 };
             soloCol.Children.Add(_soloSubText);
-            Grid.SetColumn(soloCol, 0);
+            Grid.SetColumn(soloCol, 1);
             costGrid.Children.Add(soloCol);
 
+            // MARGINAL — what muting THIS would save
             var marginalCol = new StackPanel();
             marginalCol.Children.Add(new TextBlock { Text = "MARGINAL", Foreground = BrushSubText, FontFamily = Mono, FontSize = 9 });
             _marginalCostText = new TextBlock { Text = "—", Foreground = BrushOk, FontFamily = Mono, FontSize = 14, FontWeight = FontWeights.Bold };
             marginalCol.Children.Add(_marginalCostText);
-            Grid.SetColumn(marginalCol, 1);
+            Grid.SetColumn(marginalCol, 2);
             costGrid.Children.Add(marginalCol);
 
             root.Children.Add(costGrid);
@@ -509,9 +660,16 @@ namespace WDE.PedalProfiler2
             root.Children.Add(SectionHeader("Profile All Machines"));
 
             var profRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 4) };
-            _profileAllBtn = MakeButton("Profile All", 100);
+
+            _profileAllEngineBtn = MakeButton("Profile All (Engine)", 150);
+            _profileAllEngineBtn.Click += (_, __) => StartProfileAllEngine();
+            profRow.Children.Add(_profileAllEngineBtn);
+
+            _profileAllBtn = MakeButton("Profile All (Solo)", 130);
+            _profileAllBtn.Margin = new Thickness(6, 0, 0, 0);
             _profileAllBtn.Click += (_, __) => StartProfileAll();
             profRow.Children.Add(_profileAllBtn);
+
             _profileAllStatus = new TextBlock
             {
                 Text       = "",
@@ -723,6 +881,10 @@ namespace WDE.PedalProfiler2
             // ── Mute-delta detection on selected machine ────────────────────
             DetectMuteDelta(snap);
 
+            // ── Engine-reported cost (from MachinePerformanceData) ──────────
+            if (_selectedIMachine != null)
+                UpdateEngineCost(_selectedIMachine, snap.BudgetMs);
+
             // ── Parameter activity poll for selected machine ────────────────
             PollParameterActivity();
 
@@ -928,6 +1090,8 @@ namespace WDE.PedalProfiler2
 
             if (_selectedIMachine == null)
             {
+                _engineCostText.Text       = "—";
+                _engineSubText.Text        = "";
                 _soloCostText.Text         = "—";
                 _soloSubText.Text          = "";
                 _marginalCostText.Text     = "—";
@@ -938,9 +1102,12 @@ namespace WDE.PedalProfiler2
 
             if (isControl)
             {
+                _engineCostText.Text   = "N/A";
+                _engineSubText.Text    = "(control)";
                 _soloCostText.Text     = "N/A";
-                _soloSubText.Text      = "(control machine)";
+                _soloSubText.Text      = "";
                 _marginalCostText.Text = "N/A";
+                _engineCostText.Foreground   = BrushSubText;
                 _soloCostText.Foreground     = BrushSubText;
                 _marginalCostText.Foreground = BrushSubText;
                 _measureSoloBtn.IsEnabled  = false;
@@ -951,6 +1118,28 @@ namespace WDE.PedalProfiler2
             bool canMeasure = (_measureState == MeasureState.Idle && _profileAllState != ProfileAllState.Running);
             _measureSoloBtn.IsEnabled    = canMeasure;
             _measureMarginalBtn.IsEnabled = canMeasure;
+
+            // ── ENGINE ───────────────────────────────────────────────────────
+            // Read smoothed value from per-machine state populated by OnTick's
+            // UpdateEngineCost. Falls back to "warming up" until we have two
+            // delta samples.
+            if (_enginePerf.TryGetValue(_selectedIMachine.Name, out var perfSt)
+                && !double.IsNaN(perfSt.SmoothedMsPerBuffer))
+            {
+                _engineCostText.Text       = FormatMsWithPct(perfSt.SmoothedMsPerBuffer, budget);
+                _engineCostText.Foreground = CostColor(perfSt.SmoothedMsPerBuffer, budget);
+                _engineSubText.Text        = "live  ·  delta-sampled";
+            }
+            else
+            {
+                _engineCostText.Text       = _enginePerfResolved && !_enginePerfAvailable
+                                            ? "(unavail.)"
+                                            : "…";
+                _engineCostText.Foreground = BrushSubText;
+                _engineSubText.Text        = _enginePerfResolved && !_enginePerfAvailable
+                                            ? "engine field not found"
+                                            : "warming up";
+            }
 
             // ── SOLO ─────────────────────────────────────────────────────────
             if (double.IsNaN(_soloResultMs))
@@ -967,13 +1156,13 @@ namespace WDE.PedalProfiler2
                 // Sub-line: "peak X.XX ms · median Y.YY ms (n=N)"
                 var parts = new List<string>();
                 if (!double.IsNaN(_soloPeakMs))
-                    parts.Add($"peak {_soloPeakMs:F2} ms");
+                    parts.Add($"peak {_soloPeakMs:F2}");
                 if (_recentSoloCount >= 2)
                 {
                     double med = MedianOfRecentSolo();
-                    parts.Add($"median {med:F2} ms (n={_recentSoloCount})");
+                    parts.Add($"med {med:F2} (n={_recentSoloCount})");
                 }
-                _soloSubText.Text = string.Join("  ·  ", parts);
+                _soloSubText.Text = string.Join(" · ", parts);
             }
 
             // ── MARGINAL ─────────────────────────────────────────────────────
@@ -1647,7 +1836,8 @@ namespace WDE.PedalProfiler2
             _profileAllResultsPanel.Children.Clear();
             _profileAllIdx       = 0;
             _profileAllState     = ProfileAllState.Running;
-            _profileAllBtn.IsEnabled = false;
+            _profileAllBtn.IsEnabled       = false;
+            _profileAllEngineBtn.IsEnabled = false;
             // Snapshot budget at start — bars will rescale against this rather
             // than against the heaviest machine, so absolute proportions stay
             // meaningful across runs.
@@ -1663,18 +1853,103 @@ namespace WDE.PedalProfiler2
             {
                 // Done — render results
                 _profileAllState = ProfileAllState.Done;
-                _profileAllBtn.IsEnabled = true;
-                _profileAllStatus.Text   = $"Done — profiled {_profileAllResults.Count} machine(s)";
+                _profileAllBtn.IsEnabled       = true;
+                _profileAllEngineBtn.IsEnabled = true;
+                _profileAllStatus.Text   = $"Done — solo-profiled {_profileAllResults.Count} machine(s)";
                 _profileAllStatus.Foreground = BrushOk;
                 RenderProfileAllResults();
                 return;
             }
 
             string next = _profileAllQueue[_profileAllIdx];
-            _profileAllStatus.Text = $"Profiling {_profileAllIdx + 1}/{_profileAllQueue.Count}: {next}";
+            _profileAllStatus.Text = $"Soloing {_profileAllIdx + 1}/{_profileAllQueue.Count}: {next}";
             _profileAllStatus.Foreground = BrushWarn;
             StartMeasurement(MeasureMode.Solo, next);
         }
+
+        // ─── Engine-data Profile All — no muting, ~1 second total ──────────────
+        // Reads (PerformanceCount, SampleCount) for every non-control machine at
+        // T0, waits 1 second, reads again at T1, computes per-machine delta cost
+        // from the difference. Non-invasive — playback continues normally —
+        // and the values are the engine's own per-machine accounting rather
+        // than our inferred mute-delta numbers.
+        void StartProfileAllEngine()
+        {
+            if (_profileAllState != ProfileAllState.Idle) return;
+            if (_subscribedBuzz?.Song == null || _machine == null) return;
+
+            // Read T0 snapshot for every non-control machine
+            var t0 = new Dictionary<string, (long perf, long samp)>();
+            try
+            {
+                foreach (var m in _subscribedBuzz.Song.Machines)
+                {
+                    bool isCtl = false;
+                    try { isCtl = m.IsControlMachine; } catch { }
+                    if (isCtl) continue;
+                    var raw = ReadEnginePerfRaw(m);
+                    if (raw == null) continue;
+                    t0[m.Name] = raw.Value;
+                }
+            } catch { }
+
+            if (t0.Count == 0)
+            {
+                _profileAllStatus.Text = "(engine perf data not available)";
+                _profileAllStatus.Foreground = BrushWarn;
+                return;
+            }
+
+            _profileAllResults.Clear();
+            _profileAllResultsPanel.Children.Clear();
+            _profileAllState               = ProfileAllState.Running;
+            _profileAllBtn.IsEnabled       = false;
+            _profileAllEngineBtn.IsEnabled = false;
+            _profileAllBudgetMs            = _machine.Snapshot?.BudgetMs ?? double.NaN;
+            int sampleRate                 = _machine.Snapshot?.SampleRate ?? 48000;
+            double budgetMs                = _profileAllBudgetMs;
+
+            _profileAllStatus.Text       = $"Sampling engine perf for 1.0 s ({t0.Count} machines)…";
+            _profileAllStatus.Foreground = BrushWarn;
+
+            var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1000) };
+            timer.Tick += (_, __) =>
+            {
+                timer.Stop();
+                try
+                {
+                    foreach (var m in _subscribedBuzz!.Song.Machines)
+                    {
+                        bool isCtl = false;
+                        try { isCtl = m.IsControlMachine; } catch { }
+                        if (isCtl) continue;
+                        if (!t0.TryGetValue(m.Name, out var prev)) continue;
+                        var cur = ReadEnginePerfRaw(m);
+                        if (cur == null) continue;
+
+                        long dp = cur.Value.perf - prev.perf;
+                        long ds = cur.Value.samp - prev.samp;
+                        if (ds <= 0 || dp < 0) continue;
+
+                        double cpuFraction = (dp * (double)sampleRate)
+                                             / (ds * (double)Stopwatch.Frequency);
+                        double msPerBuffer = (budgetMs > 0)
+                                            ? cpuFraction * budgetMs
+                                            : cpuFraction * 5.33;  // fallback
+                        _profileAllResults[m.Name] = msPerBuffer;
+                    }
+                } catch { }
+
+                _profileAllState               = ProfileAllState.Done;
+                _profileAllBtn.IsEnabled       = true;
+                _profileAllEngineBtn.IsEnabled = true;
+                _profileAllStatus.Text         = $"Done — engine-profiled {_profileAllResults.Count} machine(s)";
+                _profileAllStatus.Foreground   = BrushOk;
+                RenderProfileAllResults();
+            };
+            timer.Start();
+        }
+
 
         void RenderProfileAllResults()
         {
