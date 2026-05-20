@@ -1836,6 +1836,46 @@ namespace WDE.PedalProfiler2
                 DumpObject(_machine.Snapshot, "Profile2Snapshot (this v2 instance)", Line, maxDepth: 1);
             }
 
+            // ─────────────────────────────────────────────────────────────────
+            // PHASE 2: drill into perf/engine objects revealed by phase 1
+            // ─────────────────────────────────────────────────────────────────
+            Line("");
+            Line("──── PHASE 2: drill-down on perf/engine objects ────");
+
+            // Engine-level performance — what the host itself tracks for total CPU
+            DumpObject(GetProp(buzz, "PerformanceCurrent"),
+                       "BuzzPerformanceData (buzz.PerformanceCurrent)", Line, maxDepth: 1);
+            DumpObject(GetProp(buzz, "PerformanceData"),
+                       "BuzzPerformanceData (buzz.PerformanceData)",    Line, maxDepth: 1);
+
+            // The audio engine itself — buffer state, driver-side stats
+            DumpObject(GetProp(buzz, "AudioEngine"),
+                       "AudioEngine (buzz.AudioEngine)",                Line, maxDepth: 1);
+
+            // Engine settings — likely buffer size, sample-rate config, etc.
+            DumpObject(GetField(buzz, "engineSettings"),
+                       "EngineSettings (buzz.engineSettings)",          Line, maxDepth: 1);
+
+            // PER-MACHINE PERFORMANCE — the headline target. If this carries a
+            // work-time field, we can replace the entire mute-based measurement
+            // apparatus with direct reads.
+            if (_selectedIMachine != null)
+            {
+                DumpObject(GetProp(_selectedIMachine, "PerformanceData"),
+                           $"MachinePerformanceData '{_selectedIMachine.Name}'.PerformanceData",
+                           Line, maxDepth: 1);
+                DumpObject(GetProp(_selectedIMachine, "PerformanceDataCurrent"),
+                           $"MachinePerformanceData '{_selectedIMachine.Name}'.PerformanceDataCurrent",
+                           Line, maxDepth: 1);
+            }
+
+            // Sample one Spike2Record so the user can see what we capture
+            var snap = _machine?.Snapshot;
+            if (snap?.Spikes != null && snap.Spikes.Length > 0)
+            {
+                DumpObject((object)snap.Spikes[0], "Spike2Record [0]", Line, maxDepth: 1);
+            }
+
             Line("════════════════════════════════════════════════════════════");
             Line("end reflection dump");
             Line("");
@@ -1846,6 +1886,27 @@ namespace WDE.PedalProfiler2
                 System.Windows.Application.Current?.Dispatcher?.BeginInvoke(
                     (Action)(() => { try { buzz.ExecuteCommand(BuzzCommand.DebugConsole); } catch { } }));
             } catch { }
+        }
+
+        // Reflection helpers — best-effort public-property and private-field access
+        static object? GetProp(object? obj, string name)
+        {
+            if (obj == null) return null;
+            try { return obj.GetType().GetProperty(name)?.GetValue(obj); }
+            catch { return null; }
+        }
+
+        static object? GetField(object? obj, string name)
+        {
+            if (obj == null) return null;
+            try
+            {
+                var fi = obj.GetType().GetField(name,
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Public    |
+                    System.Reflection.BindingFlags.Instance);
+                return fi?.GetValue(obj);
+            } catch { return null; }
         }
 
         // Walk a single object: print its concrete type, then all public +
