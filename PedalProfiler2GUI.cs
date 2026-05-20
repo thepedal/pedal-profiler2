@@ -144,6 +144,7 @@ namespace WDE.PedalProfiler2
             public bool HasPrior;
             public double SmoothedMsPerBuffer = double.NaN;
             public double SmoothedCpuPct      = double.NaN;
+            public bool IsNative;   // true → engine perf data not tracked by host for this machine
         }
         readonly Dictionary<string, EnginePerfState> _enginePerf = new();
 
@@ -200,13 +201,34 @@ namespace WDE.PedalProfiler2
         (double msPerBuffer, double cpuPct)? UpdateEngineCost(IMachine m, double budgetMs)
         {
             if (m == null || _machine == null) return null;
+
+            // Native machines (e.g. the Master) don't populate
+            // MachinePerformanceData — values stay at zero forever. Detect
+            // upfront by ManagedMachine == null and mark accordingly so the
+            // UI can say so instead of showing "warming up" indefinitely.
+            string name = m.Name;
+            bool isNative = false;
+            try { isNative = (m.ManagedMachine == null); } catch { }
+            if (isNative)
+            {
+                if (!_enginePerf.TryGetValue(name, out var nativeSt))
+                {
+                    nativeSt = new EnginePerfState { IsNative = true };
+                    _enginePerf[name] = nativeSt;
+                }
+                else
+                {
+                    nativeSt.IsNative = true;
+                }
+                return null;
+            }
+
             var raw = ReadEnginePerfRaw(m);
             if (raw == null) return null;
 
             int sampleRate = _machine.Snapshot?.SampleRate ?? 0;
             if (sampleRate <= 0) return null;
 
-            string name = m.Name;
             if (!_enginePerf.TryGetValue(name, out var st))
             {
                 st = new EnginePerfState
@@ -326,6 +348,7 @@ namespace WDE.PedalProfiler2
         TextBlock   _activityText    = null!;
 
         TextBlock   _globalStatusText= null!;
+        TextBlock   _engineSettingsText = null!;
 
         Button      _profileAllBtn   = null!;
         Button      _profileAllEngineBtn = null!;
@@ -708,6 +731,22 @@ namespace WDE.PedalProfiler2
             root.Children.Add(diagRow);
 
             // ── Global status footer ─────────────────────────────────────────
+            var footerStack = new StackPanel();
+            footerStack.Children.Add(_globalStatusText = new TextBlock
+            {
+                Text       = "Global: — CPU · — dropouts · — spikes",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10
+            });
+            footerStack.Children.Add(_engineSettingsText = new TextBlock
+            {
+                Text       = "Engine: …",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                Margin     = new Thickness(0, 2, 0, 0)
+            });
             root.Children.Add(new Border
             {
                 Background = BrushPanel,
@@ -715,13 +754,7 @@ namespace WDE.PedalProfiler2
                 BorderThickness = new Thickness(1),
                 Padding = new Thickness(8, 4, 8, 4),
                 Margin = new Thickness(0, 8, 0, 0),
-                Child = (_globalStatusText = new TextBlock
-                {
-                    Text       = "Global: — CPU · — dropouts · — spikes",
-                    Foreground = BrushSubText,
-                    FontFamily = Mono,
-                    FontSize   = 10
-                })
+                Child = footerStack
             });
 
             Content = new ScrollViewer
@@ -1122,13 +1155,28 @@ namespace WDE.PedalProfiler2
             // ── ENGINE ───────────────────────────────────────────────────────
             // Read smoothed value from per-machine state populated by OnTick's
             // UpdateEngineCost. Falls back to "warming up" until we have two
-            // delta samples.
-            if (_enginePerf.TryGetValue(_selectedIMachine.Name, out var perfSt)
-                && !double.IsNaN(perfSt.SmoothedMsPerBuffer))
+            // delta samples. Native machines (ManagedMachine == null) show
+            // "—" with explicit "(native: N/A)" sub-text.
+            if (_enginePerf.TryGetValue(_selectedIMachine.Name, out var perfSt))
             {
-                _engineCostText.Text       = FormatMsWithPct(perfSt.SmoothedMsPerBuffer, budget);
-                _engineCostText.Foreground = CostColor(perfSt.SmoothedMsPerBuffer, budget);
-                _engineSubText.Text        = "live  ·  delta-sampled";
+                if (perfSt.IsNative)
+                {
+                    _engineCostText.Text       = "—";
+                    _engineCostText.Foreground = BrushSubText;
+                    _engineSubText.Text        = "(native: N/A)";
+                }
+                else if (!double.IsNaN(perfSt.SmoothedMsPerBuffer))
+                {
+                    _engineCostText.Text       = FormatMsWithPct(perfSt.SmoothedMsPerBuffer, budget);
+                    _engineCostText.Foreground = CostColor(perfSt.SmoothedMsPerBuffer, budget);
+                    _engineSubText.Text        = "live  ·  delta-sampled";
+                }
+                else
+                {
+                    _engineCostText.Text       = "…";
+                    _engineCostText.Foreground = BrushSubText;
+                    _engineSubText.Text        = "warming up";
+                }
             }
             else
             {
@@ -1564,14 +1612,98 @@ namespace WDE.PedalProfiler2
             if (!snap.IsValid)
             {
                 _globalStatusText.Text = "Global: warming up…";
-                return;
             }
-            int spikeCount = snap.Spikes?.Length ?? 0;
-            _globalStatusText.Text =
-                $"Global: {snap.CpuPct:F1}% CPU  ·  {snap.TotalDropouts} dropouts  ·  {spikeCount} spike(s) logged";
-            _globalStatusText.Foreground = snap.CpuPct >= 90 ? BrushBad
-                                         : snap.CpuPct >= 70 ? BrushWarn
-                                         : BrushSubText;
+            else
+            {
+                int spikeCount = snap.Spikes?.Length ?? 0;
+                _globalStatusText.Text =
+                    $"Global: {snap.CpuPct:F1}% CPU  ·  {snap.TotalDropouts} dropouts  ·  {spikeCount} spike(s) logged";
+                _globalStatusText.Foreground = snap.CpuPct >= 90 ? BrushBad
+                                             : snap.CpuPct >= 70 ? BrushWarn
+                                             : BrushSubText;
+            }
+
+            // Engine settings — read from buzz.engineSettings each tick so toggles
+            // in ReBuzz's settings window reflect live. Colored to flag the priority
+            // value when it's not on the audio-focused profile (likely cause of OS
+            // scheduling stalls under load).
+            var es = ReadEngineSettings();
+            if (es == null)
+            {
+                _engineSettingsText.Text = "Engine: (settings unavailable)";
+                _engineSettingsText.Foreground = BrushSubText;
+            }
+            else
+            {
+                string mt   = es.Multithreading      ? "MT"          : "single-thread";
+                string pmm  = es.ProcessMutedMachines ? "process-muted" : "skip-muted";
+                string llgc = es.LowLatencyGC        ? "lowGC"       : "normalGC";
+                _engineSettingsText.Text = $"Engine: {es.Priority} · {mt} · {pmm} · {llgc}";
+
+                // Flag the audio priority — non-AllFocusOnAudio profiles correlate
+                // with scheduling-induced stalls when the box is under CPU pressure.
+                bool prioHigh = es.Priority == "AllFocusOnAudio";
+                _engineSettingsText.Foreground = prioHigh ? BrushSubText : BrushWarn;
+            }
+        }
+
+        // ─── Engine settings reflection ──────────────────────────────────────
+        class EngineSettingsInfo
+        {
+            public string Priority = "?";
+            public bool   Multithreading;
+            public bool   ProcessMutedMachines;
+            public bool   LowLatencyGC;
+        }
+
+        // Resolved once on first successful read, then cached.
+        System.Reflection.FieldInfo?    _engineSettingsField;
+        System.Reflection.PropertyInfo? _esPriorityProp;
+        System.Reflection.PropertyInfo? _esMultithreadingProp;
+        System.Reflection.PropertyInfo? _esProcessMutedProp;
+        System.Reflection.PropertyInfo? _esLowLatencyGCProp;
+        bool _engineSettingsResolveFailed;
+
+        EngineSettingsInfo? ReadEngineSettings()
+        {
+            if (_engineSettingsResolveFailed) return null;
+            var buzz = _subscribedBuzz;
+            if (buzz == null) return null;
+
+            try
+            {
+                if (_engineSettingsField == null)
+                {
+                    _engineSettingsField = buzz.GetType().GetField("engineSettings",
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Public    |
+                        System.Reflection.BindingFlags.Instance);
+                    if (_engineSettingsField == null) { _engineSettingsResolveFailed = true; return null; }
+                }
+                var es = _engineSettingsField.GetValue(buzz);
+                if (es == null) return null;
+
+                if (_esPriorityProp == null)
+                {
+                    var t = es.GetType();
+                    _esPriorityProp       = t.GetProperty("PriorityProfile");
+                    _esMultithreadingProp = t.GetProperty("Multithreading");
+                    _esProcessMutedProp   = t.GetProperty("ProcessMutedMachines");
+                    _esLowLatencyGCProp   = t.GetProperty("LowLatencyGC");
+                }
+
+                var info = new EngineSettingsInfo();
+                try { info.Priority             = _esPriorityProp?.GetValue(es)?.ToString() ?? "?"; } catch { }
+                try { info.Multithreading       = (bool)(_esMultithreadingProp?.GetValue(es) ?? false); } catch { }
+                try { info.ProcessMutedMachines = (bool)(_esProcessMutedProp?.GetValue(es) ?? false); } catch { }
+                try { info.LowLatencyGC         = (bool)(_esLowLatencyGCProp?.GetValue(es) ?? false); } catch { }
+                return info;
+            }
+            catch
+            {
+                _engineSettingsResolveFailed = true;
+                return null;
+            }
         }
 
 
