@@ -165,10 +165,13 @@ namespace WDE.PedalProfiler2
                         sumSqL += (double)l * l;
                         sumSqR += (double)r * r;
                     }
-                    _masterRmsL = (float)Math.Sqrt(sumSqL / frames);
-                    _masterRmsR = (float)Math.Sqrt(sumSqR / frames);
-                    _masterPeakL = peakL;
-                    _masterPeakR = peakR;
+                    // Buzz convention: samples are in ±32768 range (16-bit
+                    // equivalent), not ±1.0. The ÷32768 conversion to dBFS
+                    // happens at the driver boundary, *after* MasterTap.
+                    _masterRmsL = (float)(Math.Sqrt(sumSqL / frames) / BUZZ_FULL_SCALE);
+                    _masterRmsR = (float)(Math.Sqrt(sumSqR / frames) / BUZZ_FULL_SCALE);
+                    _masterPeakL = peakL / BUZZ_FULL_SCALE;
+                    _masterPeakR = peakR / BUZZ_FULL_SCALE;
                 }
                 else
                 {
@@ -179,11 +182,12 @@ namespace WDE.PedalProfiler2
                         if (a > peakL) peakL = a;
                         sumSqL += (double)v * v;
                     }
-                    float rms = (float)Math.Sqrt(sumSqL / n);
+                    float rms = (float)(Math.Sqrt(sumSqL / n) / BUZZ_FULL_SCALE);
                     _masterRmsL = rms;
                     _masterRmsR = rms;
-                    _masterPeakL = peakL;
-                    _masterPeakR = peakL;
+                    float peak = peakL / BUZZ_FULL_SCALE;
+                    _masterPeakL = peak;
+                    _masterPeakR = peak;
                 }
                 System.Threading.Interlocked.Increment(ref _masterTapCallCount);
             }
@@ -192,6 +196,7 @@ namespace WDE.PedalProfiler2
                 // Audio thread — silently swallow. Never throw.
             }
         }
+        const float BUZZ_FULL_SCALE = 32768f;
 
         void HookMasterTap()
         {
