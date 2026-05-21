@@ -325,6 +325,7 @@ namespace WDE.PedalProfiler2
         TextBlock   _typeBadge       = null!;
 
         TextBlock   _periodInfoText  = null!;   // "Buffer: 5.33 ms (256 spl @ 48 kHz, 64-buf avg)"
+        TextBlock   _engineTotalText = null!;   // sum of engine-reported costs across all machines
         TextBlock   _engineCostText  = null!;   // primary live engine-reported cost
         TextBlock   _engineSubText   = null!;   // "live · MComp"
         TextBlock   _soloCostText    = null!;
@@ -507,6 +508,21 @@ namespace WDE.PedalProfiler2
                 Margin     = new Thickness(0, 0, 0, 6)
             };
             root.Children.Add(_periodInfoText);
+
+            // Engine Total — sum of engine-reported cost across all non-control
+            // non-native machines. Compared against the buffer budget, the gap
+            // is "unaccounted-for" buffer time — host overhead, idle waits,
+            // driver lag. Critical for diagnosing whether dropouts are caused
+            // by machine work or by host-level pressure.
+            _engineTotalText = new TextBlock
+            {
+                Text       = "Engine Total: —",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                Margin     = new Thickness(0, 0, 0, 6)
+            };
+            root.Children.Add(_engineTotalText);
 
             var costGrid = new Grid { Margin = new Thickness(0, 0, 0, 2) };
             costGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -924,8 +940,24 @@ namespace WDE.PedalProfiler2
             DetectMuteDelta(snap);
 
             // ── Engine-reported cost (from MachinePerformanceData) ──────────
-            if (_selectedIMachine != null)
-                UpdateEngineCost(_selectedIMachine, snap.BudgetMs);
+            // Poll every machine each tick (not just selected) so the Engine
+            // Total sum is always live. Cost is tiny — cached reflection +
+            // two field reads per machine — but lets us see what fraction of
+            // the buffer is unaccounted for (= host overhead).
+            if (_subscribedBuzz?.Song != null)
+            {
+                try
+                {
+                    foreach (var m in _subscribedBuzz.Song.Machines)
+                    {
+                        try
+                        {
+                            if (m.IsControlMachine) continue;
+                            UpdateEngineCost(m, snap.BudgetMs);
+                        } catch { }
+                    }
+                } catch { }
+            }
 
             // ── Parameter activity poll for selected machine ────────────────
             PollParameterActivity();
@@ -1125,6 +1157,44 @@ namespace WDE.PedalProfiler2
             else
             {
                 _periodInfoText.Text = "Buffer: —  (warming up)";
+            }
+
+            // ── Engine Total ────────────────────────────────────────────────
+            // Sum smoothed engine cost across all managed machines that have
+            // reported data. The gap (budget - sum) is the "unaccounted-for"
+            // budget — host overhead, scheduling waits, driver lag. Critical
+            // for distinguishing machine-cost dropouts from host-overhead
+            // dropouts.
+            double engineSumMs = 0;
+            int    engineCounted = 0;
+            int    engineNative  = 0;
+            foreach (var kv in _enginePerf)
+            {
+                if (kv.Value.IsNative) { engineNative++; continue; }
+                if (double.IsNaN(kv.Value.SmoothedMsPerBuffer)) continue;
+                engineSumMs += kv.Value.SmoothedMsPerBuffer;
+                engineCounted++;
+            }
+            if (budget > 0 && engineCounted > 0)
+            {
+                double sumPct = (engineSumMs / budget) * 100.0;
+                double gapMs  = budget - engineSumMs;
+                double gapPct = (gapMs / budget) * 100.0;
+                _engineTotalText.Text =
+                    $"Engine Total: {engineSumMs:F2} ms ({sumPct:F1}%)  ·  unaccounted: {gapMs:F2} ms ({gapPct:F1}%)  ·  n={engineCounted}" +
+                    (engineNative > 0 ? $" (+{engineNative} native)" : "");
+                // Color the line — high "unaccounted" fraction is the diagnostic
+                // signal we're looking for: host overhead consuming buffer time
+                _engineTotalText.Foreground = gapPct >= 80 ? BrushBad
+                                            : gapPct >= 50 ? BrushWarn
+                                            : BrushSubText;
+            }
+            else
+            {
+                _engineTotalText.Text = engineNative > 0
+                    ? $"Engine Total: —  ({engineNative} native machine(s); engine data unavailable)"
+                    : "Engine Total: —  (warming up)";
+                _engineTotalText.Foreground = BrushSubText;
             }
 
             bool isControl = false;
