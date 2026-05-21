@@ -134,6 +134,7 @@ namespace WDE.PedalProfiler2
         volatile float _masterRmsR;
         long           _masterTapCallCount;
         bool           _masterTapHooked;
+        Delegate?      _masterTapDelegate;   // stored so Unhook can Remove the exact instance
         // Peak hold — the UI tick decays these slowly so the visible meter
         // doesn't flicker. Updated from UI thread.
         float          _masterPeakHoldL;
@@ -197,17 +198,55 @@ namespace WDE.PedalProfiler2
             if (_masterTapHooked || _subscribedBuzz == null) return;
             try
             {
-                // MasterTap is an event-like Action field. Use reflection to
-                // add our handler so we don't replace any existing subscribers.
-                var fi = _subscribedBuzz.GetType().GetField("MasterTap");
-                if (fi == null) return;
+                // Use all-flags so we find MasterTap whether it's declared
+                // public or non-public on the concrete ReBuzzCore type.
+                const System.Reflection.BindingFlags FLAGS =
+                    System.Reflection.BindingFlags.Public    |
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance;
+
+                var fi = _subscribedBuzz.GetType().GetField("MasterTap", FLAGS);
+                if (fi == null)
+                {
+                    try { _subscribedBuzz.DCWriteLine("[PP2] MasterTap field not found via reflection"); } catch { }
+                    return;
+                }
+
+                // Build our handler as the field's exact delegate type — this
+                // sidesteps any SongTime namespace mismatch between our build's
+                // reference and ReBuzz's actual field. CreateDelegate enforces
+                // signature compatibility by structural matching.
+                var delegateType = fi.FieldType;
+                var methodInfo   = GetType().GetMethod(
+                    nameof(OnMasterTap),
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (methodInfo == null)
+                {
+                    try { _subscribedBuzz.DCWriteLine("[PP2] OnMasterTap method info lookup failed"); } catch { }
+                    return;
+                }
+
+                Delegate ours;
+                try
+                {
+                    ours = Delegate.CreateDelegate(delegateType, this, methodInfo);
+                }
+                catch (Exception ex)
+                {
+                    try { _subscribedBuzz.DCWriteLine($"[PP2] MasterTap delegate signature mismatch: {ex.Message}"); } catch { }
+                    return;
+                }
+
                 var existing = fi.GetValue(_subscribedBuzz) as Delegate;
-                Action<float[], bool, SongTime> ours = OnMasterTap;
                 var combined = Delegate.Combine(existing, ours);
                 fi.SetValue(_subscribedBuzz, combined);
-                _masterTapHooked = true;
+                _masterTapDelegate = ours;
+                _masterTapHooked   = true;
             }
-            catch { /* MasterTap unavailable — silently skip */ }
+            catch (Exception ex)
+            {
+                try { _subscribedBuzz?.DCWriteLine($"[PP2] HookMasterTap failed: {ex.GetType().Name}: {ex.Message}"); } catch { }
+            }
         }
 
         void UnhookMasterTap()
@@ -215,15 +254,19 @@ namespace WDE.PedalProfiler2
             if (!_masterTapHooked || _subscribedBuzz == null) return;
             try
             {
-                var fi = _subscribedBuzz.GetType().GetField("MasterTap");
-                if (fi == null) return;
-                var existing = fi.GetValue(_subscribedBuzz) as Delegate;
-                Action<float[], bool, SongTime> ours = OnMasterTap;
-                var remaining = Delegate.Remove(existing, ours);
+                const System.Reflection.BindingFlags FLAGS =
+                    System.Reflection.BindingFlags.Public    |
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance;
+                var fi = _subscribedBuzz.GetType().GetField("MasterTap", FLAGS);
+                if (fi == null || _masterTapDelegate == null) return;
+                var existing  = fi.GetValue(_subscribedBuzz) as Delegate;
+                var remaining = Delegate.Remove(existing, _masterTapDelegate);
                 fi.SetValue(_subscribedBuzz, remaining);
             }
             catch { }
-            _masterTapHooked = false;
+            _masterTapHooked   = false;
+            _masterTapDelegate = null;
         }
 
 
