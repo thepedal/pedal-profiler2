@@ -349,6 +349,7 @@ namespace WDE.PedalProfiler2
 
         TextBlock   _globalStatusText= null!;
         TextBlock   _engineSettingsText = null!;
+        TextBlock   _gcStatusText    = null!;
 
         Button      _profileAllBtn   = null!;
         Button      _profileAllEngineBtn = null!;
@@ -742,6 +743,14 @@ namespace WDE.PedalProfiler2
             footerStack.Children.Add(_engineSettingsText = new TextBlock
             {
                 Text       = "Engine: …",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                Margin     = new Thickness(0, 2, 0, 0)
+            });
+            footerStack.Children.Add(_gcStatusText = new TextBlock
+            {
+                Text       = "GC: …",
                 Foreground = BrushSubText,
                 FontFamily = Mono,
                 FontSize   = 10,
@@ -1645,7 +1654,83 @@ namespace WDE.PedalProfiler2
                 bool prioHigh = es.Priority == "AllFocusOnAudio";
                 _engineSettingsText.Foreground = prioHigh ? BrushSubText : BrushWarn;
             }
+
+            // GC tracking — strong candidate for the 40 ms peaks now that we've
+            // ruled out driver, song, transport, and OS priority
+            UpdateGcStatus();
         }
+
+        // ─── GC pressure tracking ────────────────────────────────────────────
+        // The dropout pattern survives empty song + stopped transport + driver
+        // change + priority change. That points at the .NET runtime itself —
+        // most likely Gen 2 collections producing ~40 ms pauses. Track Gen 0/1/2
+        // collection counts, compute per-second rates, and timestamp the last
+        // Gen 2 event. If spikes correlate with Gen 2 increments → smoking gun.
+        long _gcLastTickMs;
+        int  _gcG0Prev, _gcG1Prev, _gcG2Prev;
+        double _gcG0PerSec, _gcG1PerSec, _gcG2PerSec;
+        long _gcLastGen2Ms = -1;
+
+        void UpdateGcStatus()
+        {
+            int g0 = GC.CollectionCount(0);
+            int g1 = GC.CollectionCount(1);
+            int g2 = GC.CollectionCount(2);
+            long now = Environment.TickCount64;
+
+            // First call — seed and skip rate calc
+            if (_gcLastTickMs == 0)
+            {
+                _gcG0Prev = g0; _gcG1Prev = g1; _gcG2Prev = g2;
+                _gcLastTickMs = now;
+                _gcStatusText.Text = $"GC: G0={g0}  G1={g1}  G2={g2}  ·  warming up";
+                _gcStatusText.Foreground = BrushSubText;
+                return;
+            }
+
+            double dt = (now - _gcLastTickMs) / 1000.0;
+            if (dt >= 0.05)
+            {
+                double dg0 = (g0 - _gcG0Prev) / dt;
+                double dg1 = (g1 - _gcG1Prev) / dt;
+                double dg2 = (g2 - _gcG2Prev) / dt;
+                const double alpha = 0.2;
+                _gcG0PerSec = _gcG0PerSec * (1 - alpha) + dg0 * alpha;
+                _gcG1PerSec = _gcG1PerSec * (1 - alpha) + dg1 * alpha;
+                _gcG2PerSec = _gcG2PerSec * (1 - alpha) + dg2 * alpha;
+
+                // Mark Gen 2 events so we can highlight them and correlate with spikes
+                if (g2 > _gcG2Prev) _gcLastGen2Ms = now;
+
+                _gcG0Prev = g0; _gcG1Prev = g1; _gcG2Prev = g2;
+                _gcLastTickMs = now;
+            }
+
+            // Heap size — non-forcing read
+            long heapBytes = 0;
+            try { heapBytes = GC.GetTotalMemory(false); } catch { }
+            double heapMB = heapBytes / 1024.0 / 1024.0;
+
+            // Time since last Gen 2 — useful for spike correlation
+            string sinceG2;
+            if (_gcLastGen2Ms < 0) sinceG2 = "—";
+            else
+            {
+                long ago = now - _gcLastGen2Ms;
+                sinceG2 = ago < 1000 ? $"{ago} ms" : $"{ago / 1000.0:F1} s";
+            }
+
+            _gcStatusText.Text =
+                $"GC: G0={g0} ({_gcG0PerSec:F1}/s)  ·  G1={g1} ({_gcG1PerSec:F2}/s)  ·  G2={g2} ({_gcG2PerSec:F2}/s)  ·  heap {heapMB:F1} MB  ·  last G2 {sinceG2} ago";
+
+            // Flash red briefly after a Gen 2 collection — it's the suspected
+            // root cause, so make it visually loud when it happens
+            bool recentGen2 = (_gcLastGen2Ms >= 0 && (now - _gcLastGen2Ms) < 1500);
+            _gcStatusText.Foreground = recentGen2 ? BrushBad
+                                     : _gcG2PerSec > 0.5 ? BrushWarn
+                                     : BrushSubText;
+        }
+
 
         // ─── Engine settings reflection ──────────────────────────────────────
         class EngineSettingsInfo
