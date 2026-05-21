@@ -506,7 +506,11 @@ namespace WDE.PedalProfiler2
         StackPanel  _paramListPanel  = null!;
 
         TextBlock   _activityText    = null!;
-        TextBlock   _masterOutputText = null!;
+        Canvas      _masterBarL      = null!;
+        Canvas      _masterBarR      = null!;
+        TextBlock   _masterValsL     = null!;
+        TextBlock   _masterValsR     = null!;
+        TextBlock   _masterStatusText = null!;
 
         TextBlock   _globalStatusText= null!;
         TextBlock   _engineSettingsText = null!;
@@ -874,20 +878,101 @@ namespace WDE.PedalProfiler2
 
             // ── Master Output VU ─────────────────────────────────────────────
             // Live peak + RMS of the actual master-bus audio, captured via the
-            // buzz.MasterTap hook (audio thread). Confirms what's actually
-            // flowing — useful for detecting silence-during-CPU-saturation
-            // and similar weirdness.
+            // buzz.MasterTap hook (audio thread). Real WPF-rectangle VU meters,
+            // not Unicode text — block characters did font fallback in the
+            // text path which made bar widths unreliable.
             root.Children.Add(SectionHeader("Master Output"));
-            _masterOutputText = new TextBlock
+
+            var masterGrid = new Grid { Margin = new Thickness(0, 0, 0, 10) };
+            masterGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            masterGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            masterGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            masterGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            masterGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            // Row 0 — Left channel
+            var lLabel = new TextBlock
             {
-                Text       = "—",
+                Text = "L ",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin     = new Thickness(0, 1, 4, 1)
+            };
+            Grid.SetRow(lLabel, 0); Grid.SetColumn(lLabel, 0);
+            masterGrid.Children.Add(lLabel);
+
+            _masterBarL = new Canvas
+            {
+                Height = 14,
+                Margin = new Thickness(0, 1, 4, 1),
+                Background = new SolidColorBrush(Color.FromRgb(0x1a, 0x1a, 0x1a))
+            };
+            _masterBarL.Background.Freeze();
+            _masterBarL.SizeChanged += (_, __) => RefreshMasterOutput();
+            Grid.SetRow(_masterBarL, 0); Grid.SetColumn(_masterBarL, 1);
+            masterGrid.Children.Add(_masterBarL);
+
+            _masterValsL = new TextBlock
+            {
+                Text = "—",
                 Foreground = BrushText,
                 FontFamily = Mono,
                 FontSize   = 11,
-                Margin     = new Thickness(0, 0, 0, 10),
-                TextWrapping = TextWrapping.Wrap
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin     = new Thickness(4, 1, 0, 1)
             };
-            root.Children.Add(_masterOutputText);
+            Grid.SetRow(_masterValsL, 0); Grid.SetColumn(_masterValsL, 2);
+            masterGrid.Children.Add(_masterValsL);
+
+            // Row 1 — Right channel
+            var rLabel = new TextBlock
+            {
+                Text = "R ",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin     = new Thickness(0, 1, 4, 1)
+            };
+            Grid.SetRow(rLabel, 1); Grid.SetColumn(rLabel, 0);
+            masterGrid.Children.Add(rLabel);
+
+            _masterBarR = new Canvas
+            {
+                Height = 14,
+                Margin = new Thickness(0, 1, 4, 1),
+                Background = new SolidColorBrush(Color.FromRgb(0x1a, 0x1a, 0x1a))
+            };
+            _masterBarR.Background.Freeze();
+            _masterBarR.SizeChanged += (_, __) => RefreshMasterOutput();
+            Grid.SetRow(_masterBarR, 1); Grid.SetColumn(_masterBarR, 1);
+            masterGrid.Children.Add(_masterBarR);
+
+            _masterValsR = new TextBlock
+            {
+                Text = "—",
+                Foreground = BrushText,
+                FontFamily = Mono,
+                FontSize   = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin     = new Thickness(4, 1, 0, 1)
+            };
+            Grid.SetRow(_masterValsR, 1); Grid.SetColumn(_masterValsR, 2);
+            masterGrid.Children.Add(_masterValsR);
+
+            root.Children.Add(masterGrid);
+
+            _masterStatusText = new TextBlock
+            {
+                Text = "",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                Margin     = new Thickness(0, 0, 0, 10)
+            };
+            root.Children.Add(_masterStatusText);
 
             // ── Profile-All ──────────────────────────────────────────────────
             root.Children.Add(SectionHeader("Profile All Machines"));
@@ -1574,8 +1659,8 @@ namespace WDE.PedalProfiler2
 
         // ─── Master Output VU ────────────────────────────────────────────────
         // Reads the volatile peak/RMS values populated from the audio thread
-        // and renders a two-bar text display. Peak-hold decay is UI-side so
-        // visible meters don't flicker.
+        // and draws color-coded VU bars on the L/R canvases. Peak-hold decay
+        // is UI-side at 6 dB/sec so visible meters don't flicker.
         void RefreshMasterOutput()
         {
             // Pull volatile snapshots
@@ -1600,47 +1685,135 @@ namespace WDE.PedalProfiler2
 
             if (!_masterTapHooked)
             {
-                _masterOutputText.Text       = "(MasterTap not available)";
-                _masterOutputText.Foreground = BrushSubText;
+                _masterStatusText.Text       = "(MasterTap not available — see Debug Console)";
+                _masterStatusText.Foreground = BrushSubText;
+                _masterValsL.Text = _masterValsR.Text = "—";
+                _masterBarL.Children.Clear();
+                _masterBarR.Children.Clear();
                 return;
             }
             if (calls == 0)
             {
-                _masterOutputText.Text       = "(no audio rendered yet)";
-                _masterOutputText.Foreground = BrushSubText;
+                _masterStatusText.Text       = "(no audio rendered yet)";
+                _masterStatusText.Foreground = BrushSubText;
+                _masterValsL.Text = _masterValsR.Text = "—";
+                _masterBarL.Children.Clear();
+                _masterBarR.Children.Clear();
                 return;
             }
+            _masterStatusText.Text = "";
 
-            string bar(float v) => DbBar(v, 24);
-            string fmt(float v)
-            {
-                double db = v < 1e-6f ? double.NegativeInfinity : 20.0 * Math.Log10(v);
-                return double.IsNegativeInfinity(db) ? " -inf " : $"{db,6:F1}";
-            }
+            DrawVuBar(_masterBarL, _masterPeakHoldL, peakL, rmsL);
+            DrawVuBar(_masterBarR, _masterPeakHoldR, peakR, rmsR);
 
-            _masterOutputText.Text =
-                $"L  {bar(_masterPeakHoldL)}  peak {fmt(peakL)} dB  ·  rms {fmt(rmsL)} dB\n" +
-                $"R  {bar(_masterPeakHoldR)}  peak {fmt(peakR)} dB  ·  rms {fmt(rmsR)} dB";
-
-            // Color the whole block red if clipping (peak >= 0 dBFS ≈ 1.0)
-            bool clipping = peakL >= 0.999f || peakR >= 0.999f;
-            bool silent   = peakL < 1e-5f && peakR < 1e-5f;
-            _masterOutputText.Foreground = clipping ? BrushBad
-                                         : silent   ? BrushSubText
-                                         : BrushText;
+            _masterValsL.Text = $"peak {FormatDb(peakL),7}  ·  rms {FormatDb(rmsL),7}";
+            _masterValsR.Text = $"peak {FormatDb(peakR),7}  ·  rms {FormatDb(rmsR),7}";
         }
 
-        // Build a Unicode block-character bar showing dB level. -60 dB → empty,
-        // 0 dB → full. Uses U+2588 (full) and U+2591 (light).
-        static string DbBar(float lin, int totalChars)
+        static string FormatDb(float lin)
         {
-            double db = lin < 1e-6f ? -120 : 20.0 * Math.Log10(lin);
-            double frac = (db + 60) / 60.0;  // -60..0 → 0..1
-            if (frac < 0) frac = 0;
-            if (frac > 1) frac = 1;
-            int filled = (int)Math.Round(frac * totalChars);
-            // Build with stackalloc-style efficiency — but small string, fine
-            return new string('█', filled) + new string('░', totalChars - filled);
+            if (lin < 1e-6f) return "-inf";
+            double db = 20.0 * Math.Log10(lin);
+            return $"{db:F1} dB";
+        }
+
+        // Draws one VU bar with color zones (green/yellow/orange/red) and a
+        // peak-hold marker. RMS rendered as a darker mid-bar line for context.
+        // Scale: -60 dB → empty (left), 0 dB → full (right).
+        void DrawVuBar(Canvas canvas, float peakHold, float currentPeak, float rms)
+        {
+            canvas.Children.Clear();
+            double w = canvas.ActualWidth;
+            double h = canvas.Height;
+            if (w <= 0 || h <= 0) return;
+
+            // Convert linear amplitudes to dB and then to bar fractions (0..1)
+            static double LinToFrac(float lin)
+            {
+                if (lin < 1e-6f) return 0;
+                double db = 20.0 * Math.Log10(lin);
+                double frac = (db + 60) / 60.0;
+                return frac < 0 ? 0 : frac > 1 ? 1 : frac;
+            }
+
+            double fracPeak = LinToFrac(peakHold);
+            double fracCur  = LinToFrac(currentPeak);
+            double fracRms  = LinToFrac(rms);
+
+            // Build the "filled" portion as a sequence of colored zone rectangles,
+            // each clipped at the current peak-hold position. Zones (dB → frac):
+            //   -60..-18 (0.00..0.70)  green
+            //   -18..-6  (0.70..0.90)  yellow
+            //   -6..0    (0.90..1.00)  orange
+            //   above 0  (>1.00)       red — only visible if clipping
+            void AddZone(double startFrac, double endFrac, Color c)
+            {
+                double s = startFrac * w;
+                double e = Math.Min(endFrac, fracPeak) * w;
+                if (e <= s) return;
+                var brush = new SolidColorBrush(c);
+                brush.Freeze();
+                var r = new Rectangle { Width = e - s, Height = h, Fill = brush };
+                Canvas.SetLeft(r, s);
+                Canvas.SetTop(r, 0);
+                canvas.Children.Add(r);
+            }
+            AddZone(0.00, 0.70, Color.FromRgb(0x40, 0xb0, 0x40));  // green
+            AddZone(0.70, 0.90, Color.FromRgb(0xd0, 0xc0, 0x30));  // yellow
+            AddZone(0.90, 1.00, Color.FromRgb(0xe0, 0x80, 0x30));  // orange
+            if (fracPeak > 1.0)
+            {
+                // shouldn't happen since we clip to 1.0, but if clipping is
+                // ever extended beyond 0 dBFS this would be the red zone
+            }
+
+            // Tick markers at -36, -24, -18, -12, -6 dB
+            foreach (double db in new[] { -36.0, -24.0, -18.0, -12.0, -6.0 })
+            {
+                double x = ((db + 60) / 60.0) * w;
+                var tick = new Rectangle
+                {
+                    Width  = 1,
+                    Height = h * 0.3,
+                    Fill   = new SolidColorBrush(Color.FromArgb(0x80, 0x70, 0x70, 0x70))
+                };
+                ((SolidColorBrush)tick.Fill).Freeze();
+                Canvas.SetLeft(tick, x);
+                Canvas.SetTop(tick, h - h * 0.3);
+                canvas.Children.Add(tick);
+            }
+
+            // RMS marker — thin darker bar inside the filled zone
+            if (fracRms > 0)
+            {
+                double rmsX = fracRms * w;
+                var rmsLine = new Rectangle
+                {
+                    Width = 1.5,
+                    Height = h * 0.6,
+                    Fill = new SolidColorBrush(Color.FromArgb(0xb0, 0xff, 0xff, 0xff))
+                };
+                ((SolidColorBrush)rmsLine.Fill).Freeze();
+                Canvas.SetLeft(rmsLine, rmsX - 0.75);
+                Canvas.SetTop(rmsLine, h * 0.2);
+                canvas.Children.Add(rmsLine);
+            }
+
+            // Current-peak indicator (instantaneous, not held) — small white line
+            if (fracCur > 0)
+            {
+                double curX = fracCur * w;
+                var marker = new Rectangle
+                {
+                    Width = 2,
+                    Height = h,
+                    Fill = Brushes.White,
+                    Opacity = 0.85
+                };
+                Canvas.SetLeft(marker, Math.Min(curX, w - 2));
+                Canvas.SetTop(marker, 0);
+                canvas.Children.Add(marker);
+            }
         }
 
 
@@ -2029,13 +2202,15 @@ namespace WDE.PedalProfiler2
             // Compute interval statistics — if intervals are tightly clustered
             // (CV < ~0.1) the spikes are periodic; that's a strong signal of
             // a regular host event (timer, DPC, etc.) vs random scheduling noise.
+            // Spikes are stored newest-first, so consecutive deltas come out
+            // negative — take abs so the stats are meaningful regardless.
             string intervalSummary = "";
             if (snap.Spikes.Length >= 2)
             {
                 double sum = 0, sumSq = 0; int n = 0;
                 for (int i = 1; i < snap.Spikes.Length; i++)
                 {
-                    double dt = (snap.Spikes[i].ElapsedSec - snap.Spikes[i - 1].ElapsedSec) * 1000.0;
+                    double dt = Math.Abs((snap.Spikes[i].ElapsedSec - snap.Spikes[i - 1].ElapsedSec) * 1000.0);
                     if (dt > 0) { sum += dt; sumSq += dt * dt; n++; }
                 }
                 if (n > 0)
@@ -2096,11 +2271,13 @@ namespace WDE.PedalProfiler2
                 double secs = elapsed - minutes * 60.0;
                 string timeStr = $"+{minutes}:{secs:00.0}";
 
-                // Interval since previous spike (— for the first row)
+                // Interval since previous spike (— for the first row).
+                // Spikes are stored newest-first; take abs so the gap is always
+                // shown as a positive duration regardless of iteration direction.
                 string deltaStr;
                 if (prevElapsed.HasValue)
                 {
-                    double dtMs = (elapsed - prevElapsed.Value) * 1000.0;
+                    double dtMs = Math.Abs((elapsed - prevElapsed.Value) * 1000.0);
                     deltaStr = dtMs >= 1000 ? $"{dtMs / 1000.0:F1}s" : $"{dtMs:F0}ms";
                 }
                 else deltaStr = "—";
