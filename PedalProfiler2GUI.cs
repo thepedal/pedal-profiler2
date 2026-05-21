@@ -21,6 +21,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
 using System.Windows.Threading;
+using Buzz.MachineInterface;
 using BuzzGUI.Interfaces;
 
 namespace WDE.PedalProfiler2
@@ -49,6 +50,7 @@ namespace WDE.PedalProfiler2
             set
             {
                 // Unsubscribe from old buzz
+                UnhookMasterTap();
                 if (_subscribedBuzz?.Song != null)
                 {
                     try
@@ -67,6 +69,7 @@ namespace WDE.PedalProfiler2
                     _subscribedBuzz.Song.MachineAdded   += OnMachineAdded;
                     _subscribedBuzz.Song.MachineRemoved += OnMachineRemoved;
                 }
+                HookMasterTap();
 
                 // Pre-seed selection from persisted state BEFORE populating
                 // the combo. RefreshMachineList will pick this up if the name
@@ -115,6 +118,113 @@ namespace WDE.PedalProfiler2
         readonly Dictionary<string, double> _paramWritesPerSec    = new();
         readonly Dictionary<string, long>   _paramLastChangeTicks = new();
         long _lastParamPollTicks = 0;
+
+
+        // ─── MasterTap subscription — actual master-bus audio analysis ───────
+        // buzz.MasterTap is an Action<float[], bool, SongTime> invoked from
+        // the audio thread with the rendered master output buffer each cycle.
+        // We hook into it to extract live peak and RMS values for L and R.
+        //
+        // CRITICAL: this handler runs on the AUDIO THREAD. Allocations, locks,
+        // exceptions — anything beyond computation on the input array — will
+        // contribute to dropouts. Volatile fields used for UI-thread reads.
+        volatile float _masterPeakL;
+        volatile float _masterPeakR;
+        volatile float _masterRmsL;
+        volatile float _masterRmsR;
+        long           _masterTapCallCount;
+        bool           _masterTapHooked;
+        // Peak hold — the UI tick decays these slowly so the visible meter
+        // doesn't flicker. Updated from UI thread.
+        float          _masterPeakHoldL;
+        float          _masterPeakHoldR;
+        long           _masterPeakHoldLastTickMs;
+
+        void OnMasterTap(float[] samples, bool stereo, SongTime time)
+        {
+            try
+            {
+                int n = samples.Length;
+                if (n <= 0) return;
+
+                float peakL = 0, peakR = 0;
+                double sumSqL = 0, sumSqR = 0;
+
+                if (stereo && n >= 2)
+                {
+                    int frames = n / 2;
+                    for (int i = 0; i < n - 1; i += 2)
+                    {
+                        float l = samples[i];
+                        float r = samples[i + 1];
+                        float aL = l < 0 ? -l : l;
+                        float aR = r < 0 ? -r : r;
+                        if (aL > peakL) peakL = aL;
+                        if (aR > peakR) peakR = aR;
+                        sumSqL += (double)l * l;
+                        sumSqR += (double)r * r;
+                    }
+                    _masterRmsL = (float)Math.Sqrt(sumSqL / frames);
+                    _masterRmsR = (float)Math.Sqrt(sumSqR / frames);
+                    _masterPeakL = peakL;
+                    _masterPeakR = peakR;
+                }
+                else
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        float v = samples[i];
+                        float a = v < 0 ? -v : v;
+                        if (a > peakL) peakL = a;
+                        sumSqL += (double)v * v;
+                    }
+                    float rms = (float)Math.Sqrt(sumSqL / n);
+                    _masterRmsL = rms;
+                    _masterRmsR = rms;
+                    _masterPeakL = peakL;
+                    _masterPeakR = peakL;
+                }
+                System.Threading.Interlocked.Increment(ref _masterTapCallCount);
+            }
+            catch
+            {
+                // Audio thread — silently swallow. Never throw.
+            }
+        }
+
+        void HookMasterTap()
+        {
+            if (_masterTapHooked || _subscribedBuzz == null) return;
+            try
+            {
+                // MasterTap is an event-like Action field. Use reflection to
+                // add our handler so we don't replace any existing subscribers.
+                var fi = _subscribedBuzz.GetType().GetField("MasterTap");
+                if (fi == null) return;
+                var existing = fi.GetValue(_subscribedBuzz) as Delegate;
+                Action<float[], bool, SongTime> ours = OnMasterTap;
+                var combined = Delegate.Combine(existing, ours);
+                fi.SetValue(_subscribedBuzz, combined);
+                _masterTapHooked = true;
+            }
+            catch { /* MasterTap unavailable — silently skip */ }
+        }
+
+        void UnhookMasterTap()
+        {
+            if (!_masterTapHooked || _subscribedBuzz == null) return;
+            try
+            {
+                var fi = _subscribedBuzz.GetType().GetField("MasterTap");
+                if (fi == null) return;
+                var existing = fi.GetValue(_subscribedBuzz) as Delegate;
+                Action<float[], bool, SongTime> ours = OnMasterTap;
+                var remaining = Delegate.Remove(existing, ours);
+                fi.SetValue(_subscribedBuzz, remaining);
+            }
+            catch { }
+            _masterTapHooked = false;
+        }
 
 
         // ─── Engine-reported per-machine cost (from MachinePerformanceData) ──
@@ -326,6 +436,7 @@ namespace WDE.PedalProfiler2
 
         TextBlock   _periodInfoText  = null!;   // "Buffer: 5.33 ms (256 spl @ 48 kHz, 64-buf avg)"
         TextBlock   _engineTotalText = null!;   // sum of engine-reported costs across all machines
+        Canvas      _engineStackCanvas = null!; // visual stacked bar of per-machine engine cost vs host overhead
         TextBlock   _engineCostText  = null!;   // primary live engine-reported cost
         TextBlock   _engineSubText   = null!;   // "live · MComp"
         TextBlock   _soloCostText    = null!;
@@ -347,6 +458,7 @@ namespace WDE.PedalProfiler2
         StackPanel  _paramListPanel  = null!;
 
         TextBlock   _activityText    = null!;
+        TextBlock   _masterOutputText = null!;
 
         TextBlock   _globalStatusText= null!;
         TextBlock   _engineSettingsText = null!;
@@ -407,6 +519,7 @@ namespace WDE.PedalProfiler2
                 _timer.Stop();
                 _measureTimer?.Stop();
                 _muteDeltaTimer?.Stop();
+                UnhookMasterTap();
 
                 if (_subscribedBuzz?.Song != null)
                 {
@@ -520,9 +633,24 @@ namespace WDE.PedalProfiler2
                 Foreground = BrushSubText,
                 FontFamily = Mono,
                 FontSize   = 10,
-                Margin     = new Thickness(0, 0, 0, 6)
+                Margin     = new Thickness(0, 0, 0, 2)
             };
             root.Children.Add(_engineTotalText);
+
+            // Visual stacked bar — each machine gets a colored segment sized
+            // proportional to its smoothed cost; the rest of the bar (in red)
+            // is unaccounted host overhead. ToolTips on each segment show
+            // the contributing machine name and ms value.
+            _engineStackCanvas = new Canvas
+            {
+                Height     = 14,
+                Margin     = new Thickness(0, 0, 0, 6),
+                Background = new SolidColorBrush(Color.FromRgb(0x1a, 0x1a, 0x1a))
+            };
+            _engineStackCanvas.Background.Freeze();
+            // Redraw on resize so the bar tracks panel width
+            _engineStackCanvas.SizeChanged += (_, __) => RefreshEngineStack();
+            root.Children.Add(_engineStackCanvas);
 
             var costGrid = new Grid { Margin = new Thickness(0, 0, 0, 2) };
             costGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -696,6 +824,23 @@ namespace WDE.PedalProfiler2
             };
             root.Children.Add(_activityText);
 
+            // ── Master Output VU ─────────────────────────────────────────────
+            // Live peak + RMS of the actual master-bus audio, captured via the
+            // buzz.MasterTap hook (audio thread). Confirms what's actually
+            // flowing — useful for detecting silence-during-CPU-saturation
+            // and similar weirdness.
+            root.Children.Add(SectionHeader("Master Output"));
+            _masterOutputText = new TextBlock
+            {
+                Text       = "—",
+                Foreground = BrushText,
+                FontFamily = Mono,
+                FontSize   = 11,
+                Margin     = new Thickness(0, 0, 0, 10),
+                TextWrapping = TextWrapping.Wrap
+            };
+            root.Children.Add(_masterOutputText);
+
             // ── Profile-All ──────────────────────────────────────────────────
             root.Children.Add(SectionHeader("Profile All Machines"));
 
@@ -724,6 +869,39 @@ namespace WDE.PedalProfiler2
 
             _profileAllResultsPanel = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
             root.Children.Add(_profileAllResultsPanel);
+
+            // ── Diagnostics ──────────────────────────────────────────────────
+            // Reflection-dump button: walks Global.Buzz, the selected machine's
+            // ── Buffer Sweep Log ────────────────────────────────────────────
+            // Automatically records (buffer, budget, unaccounted, dropout-rate)
+            // each time the user changes ASIO buffer size, after ~3 seconds
+            // of stable measurement. Builds a table showing how host overhead
+            // and dropout rate scale with buffer size. If unaccounted stays
+            // roughly constant → fixed-cost host overhead; if it scales with
+            // buffer → per-sample work.
+            root.Children.Add(SectionHeader("Buffer Sweep Log"));
+            _sweepStatusText = new TextBlock
+            {
+                Text       = "(change ASIO buffer size in ReBuzz to record a sample)",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                Margin     = new Thickness(0, 0, 0, 4)
+            };
+            root.Children.Add(_sweepStatusText);
+
+            var sweepCtrlRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 4) };
+            var sweepClearBtn = MakeButton("Clear Log", 80);
+            sweepClearBtn.Click += (_, __) => { _sweepLog.Clear(); RefreshSweepDisplay(); };
+            sweepCtrlRow.Children.Add(sweepClearBtn);
+            var sweepRecordBtn = MakeButton("Force Record", 110);
+            sweepRecordBtn.Margin = new Thickness(6, 0, 0, 0);
+            sweepRecordBtn.Click += (_, __) => RecordSweepSample(force: true);
+            sweepCtrlRow.Children.Add(sweepRecordBtn);
+            root.Children.Add(sweepCtrlRow);
+
+            _sweepLogPanel = new StackPanel { Margin = new Thickness(0, 0, 0, 10) };
+            root.Children.Add(_sweepLogPanel);
 
             // ── Diagnostics ──────────────────────────────────────────────────
             // Reflection-dump button: walks Global.Buzz, the selected machine's
@@ -971,7 +1149,9 @@ namespace WDE.PedalProfiler2
             RefreshSpikeAttribution(snap);
             RefreshParameterValues();
             RefreshActivity();
+            RefreshMasterOutput();
             RefreshGlobalStatus(snap);
+            UpdateSweep(snap);
             DrawSparkline();
         }
 
@@ -1139,6 +1319,372 @@ namespace WDE.PedalProfiler2
         }
 
 
+        // ─── Buffer Sweep Log ────────────────────────────────────────────────
+        // Detects when the user changes ASIO buffer size in ReBuzz (the budget
+        // changes), waits ~3 seconds for new measurement to stabilize, then
+        // records a sample (buffer, budget, unaccounted, dropout-rate). The
+        // resulting table shows how host overhead scales with buffer size —
+        // central diagnostic for the "host overhead dominates small buffers"
+        // hypothesis.
+        class SweepEntry
+        {
+            public int      BufferSamples;
+            public double   BudgetMs;
+            public double   UnaccountedMs;
+            public double   UnaccountedPct;
+            public double   DropoutRatePct;
+            public DateTime When;
+        }
+        readonly List<SweepEntry> _sweepLog = new();
+        TextBlock   _sweepStatusText = null!;
+        StackPanel  _sweepLogPanel   = null!;
+
+        double _sweepLastBudget;
+        long   _sweepStableSinceMs;
+        long   _sweepLastDropoutsSnapshot;
+        long   _sweepLastBuffersSnapshot;
+        const long SWEEP_STABILIZE_MS = 3000;
+
+        void UpdateSweep(Profile2Snapshot snap)
+        {
+            double budget = snap.BudgetMs;
+            if (budget <= 0) return;
+
+            long now = Environment.TickCount64;
+
+            // Detect significant budget change (>10%) — that's a buffer-size change
+            bool changed = _sweepLastBudget > 0
+                         && Math.Abs(budget - _sweepLastBudget) / _sweepLastBudget > 0.10;
+
+            if (changed || _sweepLastBudget == 0)
+            {
+                _sweepStableSinceMs       = now;
+                _sweepLastBudget          = budget;
+                _sweepLastDropoutsSnapshot = snap.TotalDropouts;
+                _sweepLastBuffersSnapshot  = snap.TotalBuffers;
+                _sweepStatusText.Text       = $"Buffer changed → stabilizing… ({SWEEP_STABILIZE_MS / 1000} s)";
+                _sweepStatusText.Foreground = BrushWarn;
+                return;
+            }
+            _sweepLastBudget = budget;
+
+            // Stable enough? Record.
+            if (_sweepStableSinceMs > 0 && (now - _sweepStableSinceMs) >= SWEEP_STABILIZE_MS)
+            {
+                RecordSweepSample(force: false);
+                _sweepStableSinceMs = 0;  // wait for next change
+            }
+            else if (_sweepStableSinceMs > 0)
+            {
+                long remaining = SWEEP_STABILIZE_MS - (now - _sweepStableSinceMs);
+                _sweepStatusText.Text       = $"Stabilizing… {remaining / 1000.0:F1} s remaining";
+                _sweepStatusText.Foreground = BrushWarn;
+            }
+            else
+            {
+                _sweepStatusText.Text       = _sweepLog.Count == 0
+                                            ? "(change ASIO buffer size in ReBuzz to record a sample)"
+                                            : $"({_sweepLog.Count} sample(s) recorded — change buffer to capture another)";
+                _sweepStatusText.Foreground = BrushSubText;
+            }
+        }
+
+        void RecordSweepSample(bool force)
+        {
+            var snap = _machine?.Snapshot;
+            if (snap == null || !snap.IsValid) return;
+            double budget = snap.BudgetMs;
+            int    sr     = snap.SampleRate;
+            if (budget <= 0 || sr <= 0) return;
+
+            // Recompute engine total at moment of recording
+            double engineSumMs = 0;
+            foreach (var kv in _enginePerf)
+            {
+                if (kv.Value.IsNative) continue;
+                if (double.IsNaN(kv.Value.SmoothedMsPerBuffer)) continue;
+                engineSumMs += kv.Value.SmoothedMsPerBuffer;
+            }
+            double unaccountedMs = budget - engineSumMs;
+
+            // Dropout rate since the stabilization point (or all-time if forced)
+            long dropoutsDelta;
+            long buffersDelta;
+            if (force || _sweepLastBuffersSnapshot == 0)
+            {
+                dropoutsDelta = snap.TotalDropouts;
+                buffersDelta  = snap.TotalBuffers;
+            }
+            else
+            {
+                dropoutsDelta = snap.TotalDropouts - _sweepLastDropoutsSnapshot;
+                buffersDelta  = snap.TotalBuffers  - _sweepLastBuffersSnapshot;
+            }
+            double dropoutPct = buffersDelta > 0 ? dropoutsDelta * 100.0 / buffersDelta : 0;
+
+            int spl = (int)Math.Round(budget * sr / 1000.0);
+
+            // De-dupe: if the most recent entry matches this buffer size, replace it
+            if (_sweepLog.Count > 0 && Math.Abs(_sweepLog[^1].BufferSamples - spl) <= 4)
+            {
+                _sweepLog.RemoveAt(_sweepLog.Count - 1);
+            }
+
+            _sweepLog.Add(new SweepEntry
+            {
+                BufferSamples = spl,
+                BudgetMs      = budget,
+                UnaccountedMs = unaccountedMs,
+                UnaccountedPct = budget > 0 ? (unaccountedMs / budget) * 100.0 : 0,
+                DropoutRatePct = dropoutPct,
+                When = DateTime.Now
+            });
+
+            // Reset the dropout-delta baseline so next sample measures from now
+            _sweepLastDropoutsSnapshot = snap.TotalDropouts;
+            _sweepLastBuffersSnapshot  = snap.TotalBuffers;
+
+            RefreshSweepDisplay();
+        }
+
+        void RefreshSweepDisplay()
+        {
+            _sweepLogPanel.Children.Clear();
+            if (_sweepLog.Count == 0) return;
+
+            _sweepLogPanel.Children.Add(new TextBlock
+            {
+                Text       = "  buffer   budget    unaccounted        dropout    captured",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 9,
+                Margin     = new Thickness(0, 0, 0, 2)
+            });
+
+            foreach (var e in _sweepLog)
+            {
+                var row = new TextBlock
+                {
+                    FontFamily = Mono,
+                    FontSize   = 10,
+                    Margin     = new Thickness(0, 1, 0, 1)
+                };
+                // Color the unaccounted % to telegraph host-overhead severity
+                var unaccColor = e.UnaccountedPct >= 80 ? BrushBad
+                              : e.UnaccountedPct >= 50 ? BrushWarn
+                              : BrushOk;
+                row.Inlines.Add(new System.Windows.Documents.Run
+                {
+                    Text       = $"  {e.BufferSamples,4} spl  {e.BudgetMs,6:F2} ms  ",
+                    Foreground = BrushText
+                });
+                row.Inlines.Add(new System.Windows.Documents.Run
+                {
+                    Text       = $"{e.UnaccountedMs,5:F2} ms ({e.UnaccountedPct,5:F1}%)",
+                    Foreground = unaccColor,
+                    FontWeight = FontWeights.Bold
+                });
+                row.Inlines.Add(new System.Windows.Documents.Run
+                {
+                    Text       = $"  {e.DropoutRatePct,5:F1}%   {e.When:HH:mm:ss}",
+                    Foreground = BrushText
+                });
+                _sweepLogPanel.Children.Add(row);
+            }
+
+            // Pattern hint — if unaccounted is roughly constant across rows,
+            // it's fixed-cost host overhead. If it scales with buffer, it's
+            // per-sample work.
+            if (_sweepLog.Count >= 2)
+            {
+                double minU = double.MaxValue, maxU = double.MinValue;
+                foreach (var e in _sweepLog)
+                {
+                    if (e.UnaccountedMs < minU) minU = e.UnaccountedMs;
+                    if (e.UnaccountedMs > maxU) maxU = e.UnaccountedMs;
+                }
+                double range = maxU - minU;
+                double mean  = (minU + maxU) / 2;
+                string verdict;
+                if (mean > 0 && range / mean < 0.30)
+                    verdict = $"→ unaccounted is roughly constant ({mean:F2} ms): fixed-cost host overhead";
+                else
+                    verdict = $"→ unaccounted scales with buffer (min {minU:F2} ms, max {maxU:F2} ms): includes per-sample work";
+
+                _sweepLogPanel.Children.Add(new TextBlock
+                {
+                    Text       = verdict,
+                    Foreground = BrushAccent,
+                    FontFamily = Mono,
+                    FontSize   = 10,
+                    FontStyle  = FontStyles.Italic,
+                    Margin     = new Thickness(0, 6, 0, 0)
+                });
+            }
+        }
+
+
+        // ─── Master Output VU ────────────────────────────────────────────────
+        // Reads the volatile peak/RMS values populated from the audio thread
+        // and renders a two-bar text display. Peak-hold decay is UI-side so
+        // visible meters don't flicker.
+        void RefreshMasterOutput()
+        {
+            // Pull volatile snapshots
+            float peakL = _masterPeakL;
+            float peakR = _masterPeakR;
+            float rmsL  = _masterRmsL;
+            float rmsR  = _masterRmsR;
+            long  calls = System.Threading.Interlocked.Read(ref _masterTapCallCount);
+
+            // Decay peak-hold by ~6 dB/sec
+            long now = Environment.TickCount64;
+            if (_masterPeakHoldLastTickMs > 0)
+            {
+                float dt = (now - _masterPeakHoldLastTickMs) / 1000.0f;
+                float decay = (float)Math.Pow(10, -6 * dt / 20.0); // -6 dB/sec
+                _masterPeakHoldL *= decay;
+                _masterPeakHoldR *= decay;
+            }
+            _masterPeakHoldLastTickMs = now;
+            if (peakL > _masterPeakHoldL) _masterPeakHoldL = peakL;
+            if (peakR > _masterPeakHoldR) _masterPeakHoldR = peakR;
+
+            if (!_masterTapHooked)
+            {
+                _masterOutputText.Text       = "(MasterTap not available)";
+                _masterOutputText.Foreground = BrushSubText;
+                return;
+            }
+            if (calls == 0)
+            {
+                _masterOutputText.Text       = "(no audio rendered yet)";
+                _masterOutputText.Foreground = BrushSubText;
+                return;
+            }
+
+            string bar(float v) => DbBar(v, 24);
+            string fmt(float v)
+            {
+                double db = v < 1e-6f ? double.NegativeInfinity : 20.0 * Math.Log10(v);
+                return double.IsNegativeInfinity(db) ? " -inf " : $"{db,6:F1}";
+            }
+
+            _masterOutputText.Text =
+                $"L  {bar(_masterPeakHoldL)}  peak {fmt(peakL)} dB  ·  rms {fmt(rmsL)} dB\n" +
+                $"R  {bar(_masterPeakHoldR)}  peak {fmt(peakR)} dB  ·  rms {fmt(rmsR)} dB";
+
+            // Color the whole block red if clipping (peak >= 0 dBFS ≈ 1.0)
+            bool clipping = peakL >= 0.999f || peakR >= 0.999f;
+            bool silent   = peakL < 1e-5f && peakR < 1e-5f;
+            _masterOutputText.Foreground = clipping ? BrushBad
+                                         : silent   ? BrushSubText
+                                         : BrushText;
+        }
+
+        // Build a Unicode block-character bar showing dB level. -60 dB → empty,
+        // 0 dB → full. Uses U+2588 (full) and U+2591 (light).
+        static string DbBar(float lin, int totalChars)
+        {
+            double db = lin < 1e-6f ? -120 : 20.0 * Math.Log10(lin);
+            double frac = (db + 60) / 60.0;  // -60..0 → 0..1
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
+            int filled = (int)Math.Round(frac * totalChars);
+            // Build with stackalloc-style efficiency — but small string, fine
+            return new string('█', filled) + new string('░', totalChars - filled);
+        }
+
+
+        // ─── Engine Total stacked bar ─────────────────────────────────────────
+        // Each managed machine that's reporting engine cost gets a colored
+        // segment; the remainder (host overhead) is filled in red. ToolTips
+        // identify each segment. Recomputed each cost-panel refresh.
+        static readonly Color[] _stackColors =
+        {
+            Color.FromRgb(0x4a, 0x9e, 0xff),  // blue
+            Color.FromRgb(0x6a, 0xc8, 0x6a),  // green
+            Color.FromRgb(0xff, 0xa0, 0x4a),  // orange
+            Color.FromRgb(0xc6, 0x82, 0xff),  // purple
+            Color.FromRgb(0x4a, 0xc8, 0xc8),  // cyan
+            Color.FromRgb(0xff, 0x82, 0xa0),  // pink
+            Color.FromRgb(0xc8, 0xc8, 0x4a),  // yellow
+            Color.FromRgb(0x82, 0xff, 0xa0),  // mint
+        };
+
+        void RefreshEngineStack()
+        {
+            _engineStackCanvas.Children.Clear();
+            double budget = _machine?.Snapshot?.BudgetMs ?? 0;
+            double width  = _engineStackCanvas.ActualWidth;
+            if (budget <= 0 || width <= 0) return;
+
+            // Gather managed machine costs in descending order of magnitude.
+            // Native machines contribute nothing to the engine sum so we skip them
+            // but count them so the tooltip on host overhead can mention them.
+            var entries = new List<(string name, double ms)>();
+            int nativeCount = 0;
+            foreach (var kv in _enginePerf)
+            {
+                if (kv.Value.IsNative) { nativeCount++; continue; }
+                if (double.IsNaN(kv.Value.SmoothedMsPerBuffer)) continue;
+                if (kv.Value.SmoothedMsPerBuffer <= 0) continue;
+                entries.Add((kv.Key, kv.Value.SmoothedMsPerBuffer));
+            }
+            entries.Sort((a, b) => b.ms.CompareTo(a.ms));
+
+            double scale = width / budget;  // px per ms
+            double x = 0;
+            int idx = 0;
+            foreach (var (name, ms) in entries)
+            {
+                double w = ms * scale;
+                if (w < 0.5) { idx++; continue; }
+                var brush = new SolidColorBrush(_stackColors[idx % _stackColors.Length]);
+                brush.Freeze();
+                var rect = new Rectangle
+                {
+                    Width  = w,
+                    Height = _engineStackCanvas.Height,
+                    Fill   = brush,
+                    ToolTip = $"{name}: {ms:F2} ms ({ms / budget * 100:F1}% of buffer)"
+                };
+                Canvas.SetLeft(rect, x);
+                Canvas.SetTop(rect, 0);
+                _engineStackCanvas.Children.Add(rect);
+                x += w;
+                idx++;
+            }
+
+            // Host overhead = whatever's left of the budget
+            double hostW = width - x;
+            if (hostW > 0.5)
+            {
+                double hostMs = hostW / scale;
+                string label = nativeCount > 0
+                    ? $"host overhead + native ({nativeCount}): {hostMs:F2} ms ({hostMs / budget * 100:F1}%)"
+                    : $"host overhead: {hostMs:F2} ms ({hostMs / budget * 100:F1}%)";
+                // Color intensifies as host fraction grows
+                double hostPct = hostMs / budget;
+                Color hostColor = hostPct >= 0.8 ? Color.FromRgb(0xff, 0x4a, 0x4a)
+                                : hostPct >= 0.5 ? Color.FromRgb(0xff, 0x90, 0x4a)
+                                : Color.FromRgb(0x70, 0x40, 0x40);
+                var hostBrush = new SolidColorBrush(hostColor);
+                hostBrush.Freeze();
+                var hostRect = new Rectangle
+                {
+                    Width  = hostW,
+                    Height = _engineStackCanvas.Height,
+                    Fill   = hostBrush,
+                    ToolTip = label
+                };
+                Canvas.SetLeft(hostRect, x);
+                Canvas.SetTop(hostRect, 0);
+                _engineStackCanvas.Children.Add(hostRect);
+            }
+        }
+
+
         // ═════════════════════════════════════════════════════════════════════
         // Cost panel refresh
         // ═════════════════════════════════════════════════════════════════════
@@ -1196,6 +1742,9 @@ namespace WDE.PedalProfiler2
                     : "Engine Total: —  (warming up)";
                 _engineTotalText.Foreground = BrushSubText;
             }
+
+            // Redraw stacked bar for engine total visualization
+            RefreshEngineStack();
 
             bool isControl = false;
             try { isControl = _selectedIMachine?.IsControlMachine ?? false; } catch { }
@@ -1429,15 +1978,38 @@ namespace WDE.PedalProfiler2
                 if (Array.IndexOf(s.ActiveMachines, _selectedName) >= 0) activeCount++;
             }
 
+            // Compute interval statistics — if intervals are tightly clustered
+            // (CV < ~0.1) the spikes are periodic; that's a strong signal of
+            // a regular host event (timer, DPC, etc.) vs random scheduling noise.
+            string intervalSummary = "";
+            if (snap.Spikes.Length >= 2)
+            {
+                double sum = 0, sumSq = 0; int n = 0;
+                for (int i = 1; i < snap.Spikes.Length; i++)
+                {
+                    double dt = (snap.Spikes[i].ElapsedSec - snap.Spikes[i - 1].ElapsedSec) * 1000.0;
+                    if (dt > 0) { sum += dt; sumSq += dt * dt; n++; }
+                }
+                if (n > 0)
+                {
+                    double mean = sum / n;
+                    double var  = (sumSq / n) - (mean * mean);
+                    double std  = var > 0 ? Math.Sqrt(var) : 0;
+                    double cv   = mean > 0 ? std / mean : 0;
+                    string regularity = cv < 0.15 ? "periodic" : cv < 0.40 ? "semi-periodic" : "irregular";
+                    intervalSummary = $"  ·  intervals μ={mean:F0}ms σ={std:F0}ms ({regularity})";
+                }
+            }
+
             if (withData == 0)
             {
-                _spikeAttribText.Text       = $"({total} spikes captured, no attribution data yet)";
+                _spikeAttribText.Text       = $"({total} spikes captured, no attribution data yet){intervalSummary}";
                 _spikeAttribText.Foreground = BrushSubText;
             }
             else
             {
                 double pct = activeCount * 100.0 / withData;
-                _spikeAttribText.Text = $"Active during {activeCount} of last {withData} spikes ({pct:F0}%)";
+                _spikeAttribText.Text = $"Active during {activeCount} of last {withData} spikes ({pct:F0}%){intervalSummary}";
                 _spikeAttribText.Foreground = pct >= 80 ? BrushBad
                                             : pct >= 40 ? BrushWarn
                                             : BrushOk;
@@ -1460,13 +2032,14 @@ namespace WDE.PedalProfiler2
             // Header row — column labels
             _spikeListPanel.Children.Add(new TextBlock
             {
-                Text       = "  time     bpm   spike   active machines",
+                Text       = "  time     bpm   spike    Δprev   active machines",
                 Foreground = BrushSubText,
                 FontFamily = Mono,
                 FontSize   = 9,
                 Margin     = new Thickness(0, 0, 0, 2)
             });
 
+            double? prevElapsed = null;
             foreach (var sp in snap.Spikes)
             {
                 // "+M:SS.s" time format
@@ -1474,6 +2047,16 @@ namespace WDE.PedalProfiler2
                 int minutes = (int)(elapsed / 60.0);
                 double secs = elapsed - minutes * 60.0;
                 string timeStr = $"+{minutes}:{secs:00.0}";
+
+                // Interval since previous spike (— for the first row)
+                string deltaStr;
+                if (prevElapsed.HasValue)
+                {
+                    double dtMs = (elapsed - prevElapsed.Value) * 1000.0;
+                    deltaStr = dtMs >= 1000 ? $"{dtMs / 1000.0:F1}s" : $"{dtMs:F0}ms";
+                }
+                else deltaStr = "—";
+                prevElapsed = elapsed;
 
                 // Render active-machines list with the selected name highlighted
                 var inline = new TextBlock
@@ -1484,10 +2067,10 @@ namespace WDE.PedalProfiler2
                     Margin       = new Thickness(0, 1, 0, 1)
                 };
 
-                // Fixed-width prefix: time, bpm, spike-ms
+                // Fixed-width prefix: time, bpm, spike-ms, Δprev
                 inline.Inlines.Add(new System.Windows.Documents.Run
                 {
-                    Text       = $"  {timeStr,-8} {sp.Bpm,3}   {sp.SpikeMs,5:F2}   ",
+                    Text       = $"  {timeStr,-8} {sp.Bpm,3}   {sp.SpikeMs,5:F2}   {deltaStr,6}   ",
                     Foreground = BrushText
                 });
 
