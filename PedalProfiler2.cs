@@ -57,6 +57,14 @@ namespace WDE.PedalProfiler2
         public int  WindowDropouts { get; init; }
         public long TotalDropouts  { get; init; }
         public long TotalBuffers   { get; init; }
+
+        // Raw spike count — every chunk where other > 150% baseline, with NO
+        // cooldown. The Spikes[] ring is cooldown-limited (≤1 per 500 ms) for a
+        // readable list; this is the true overrun count for honest rate stats.
+        // When the recorded-ring intervals collapse to ~the cooldown, the UI
+        // uses this to report the real rate instead of a bogus periodicity.
+        public long SpikeRawTotal  { get; init; }
+        public double ElapsedSec   { get; init; }   // seconds since machine load
     }
 
     // ─── Spike capture with attribution ──────────────────────────────────────
@@ -134,6 +142,7 @@ namespace WDE.PedalProfiler2
         int  _spikeWrite      = 0;
         int  _spikeCount      = 0;
         long _lastSpikeTicks  = 0;
+        long _spikeRawTotal   = 0;   // every >150% overrun, no cooldown
 
 
         // ─── Reference timestamp for spike "+mm:ss" displays ─────────────────
@@ -260,9 +269,11 @@ namespace WDE.PedalProfiler2
 
                 // ── Spike capture: other > 150% of baseline, with cooldown ──
                 long cooldownTicks = (long)(SPIKE_COOLDOWN_MS * Stopwatch.Frequency / 1000);
-                if (otherTicks > _baselinePeriodTicks * 3 / 2 &&
-                    (nowTicks - _lastSpikeTicks) >= cooldownTicks &&
-                    _baselinePeriodTicks > 0)
+                bool isOverrun = otherTicks > _baselinePeriodTicks * 3 / 2 && _baselinePeriodTicks > 0;
+                if (isOverrun)
+                    _spikeRawTotal++;   // true count, no cooldown — for honest rate stats
+                if (isOverrun &&
+                    (nowTicks - _lastSpikeTicks) >= cooldownTicks)
                 {
                     double freq = Stopwatch.Frequency;
                     int bpm = 0;
@@ -328,7 +339,9 @@ namespace WDE.PedalProfiler2
                         Spikes         = spikes,
                         WindowDropouts = _windowDropouts,
                         TotalDropouts  = _totalDropouts,
-                        TotalBuffers   = _totalBuffers
+                        TotalBuffers   = _totalBuffers,
+                        SpikeRawTotal  = _spikeRawTotal,
+                        ElapsedSec     = (nowTicks - _loadTimestamp) / freq
                     };
 
                     // Reset window accumulators

@@ -121,13 +121,16 @@ namespace WDE.PedalProfiler2
 
 
         // ─── MasterTap subscription — actual master-bus audio analysis ───────
-        // buzz.MasterTap is an Action<float[], bool, SongTime> invoked from
-        // the audio thread with the rendered master output buffer each cycle.
+        // buzz.MasterTap delivers the rendered master output buffer each chunk.
         // We hook into it to extract live peak and RMS values for L and R.
         //
-        // CRITICAL: this handler runs on the AUDIO THREAD. Allocations, locks,
-        // exceptions — anything beyond computation on the input array — will
-        // contribute to dropouts. Volatile fields used for UI-thread reads.
+        // THREADING NOTE: in ReBuzz ≤1826 MasterTap fired on the AUDIO THREAD;
+        // in 1827+ it is a proper event marshalled to the GUI thread via
+        // dispatcher.BeginInvoke. We keep this handler allocation-free, lock-free
+        // and exception-swallowed regardless — that's correct (and harmless) on
+        // either thread, and means the same code is safe across both builds.
+        // Volatile fields used for UI-thread reads (redundant but harmless when
+        // the callback is already on the GUI thread).
         volatile float _masterPeakL;
         volatile float _masterPeakR;
         volatile float _masterRmsL;
@@ -135,6 +138,7 @@ namespace WDE.PedalProfiler2
         long           _masterTapCallCount;
         bool           _masterTapHooked;
         Delegate?      _masterTapDelegate;   // stored so Unhook can Remove the exact instance
+        bool           _masterTapViaEvent;   // true = subscribed via event add/remove (1827+), false = field manipulation (1826)
         // Peak hold — the UI tick decays these slowly so the visible meter
         // doesn't flicker. Updated from UI thread.
         float          _masterPeakHoldL;
@@ -203,26 +207,13 @@ namespace WDE.PedalProfiler2
             if (_masterTapHooked || _subscribedBuzz == null) return;
             try
             {
-                // Use all-flags so we find MasterTap whether it's declared
-                // public or non-public on the concrete ReBuzzCore type.
                 const System.Reflection.BindingFlags FLAGS =
                     System.Reflection.BindingFlags.Public    |
                     System.Reflection.BindingFlags.NonPublic |
                     System.Reflection.BindingFlags.Instance;
 
-                var fi = _subscribedBuzz.GetType().GetField("MasterTap", FLAGS);
-                if (fi == null)
-                {
-                    try { _subscribedBuzz.DCWriteLine("[PP2] MasterTap field not found via reflection"); } catch { }
-                    return;
-                }
-
-                // Build our handler as the field's exact delegate type — this
-                // sidesteps any SongTime namespace mismatch between our build's
-                // reference and ReBuzz's actual field. CreateDelegate enforces
-                // signature compatibility by structural matching.
-                var delegateType = fi.FieldType;
-                var methodInfo   = GetType().GetMethod(
+                var t = _subscribedBuzz.GetType();
+                var methodInfo = GetType().GetMethod(
                     nameof(OnMasterTap),
                     System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                 if (methodInfo == null)
@@ -231,10 +222,43 @@ namespace WDE.PedalProfiler2
                     return;
                 }
 
-                Delegate ours;
+                // ReBuzz 1827+ declares MasterTap as a proper `event` (fired on
+                // the GUI thread via dispatcher). Prefer the add/remove accessors
+                // — they're atomic against other subscribers (HDRecorder, Signal
+                // Analysis, About window). Fall back to direct field manipulation
+                // for older builds where MasterTap was a plain Action field.
+                var ev = t.GetEvent("MasterTap", FLAGS);
+                if (ev != null && ev.EventHandlerType != null)
+                {
+                    try
+                    {
+                        var ours = Delegate.CreateDelegate(ev.EventHandlerType, this, methodInfo);
+                        ev.AddEventHandler(_subscribedBuzz, ours);
+                        _masterTapDelegate = ours;
+                        _masterTapViaEvent = true;
+                        _masterTapHooked   = true;
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _subscribedBuzz.DCWriteLine($"[PP2] MasterTap event subscribe failed: {ex.Message} — trying field"); } catch { }
+                    }
+                }
+
+                // Fallback: plain field (1826 and earlier). CreateDelegate against
+                // the field's exact delegate type sidesteps SongTime namespace
+                // mismatch via structural signature matching.
+                var fi = t.GetField("MasterTap", FLAGS);
+                if (fi == null)
+                {
+                    try { _subscribedBuzz.DCWriteLine("[PP2] MasterTap not found as event or field"); } catch { }
+                    return;
+                }
+
+                Delegate fieldDelegate;
                 try
                 {
-                    ours = Delegate.CreateDelegate(delegateType, this, methodInfo);
+                    fieldDelegate = Delegate.CreateDelegate(fi.FieldType, this, methodInfo);
                 }
                 catch (Exception ex)
                 {
@@ -243,9 +267,9 @@ namespace WDE.PedalProfiler2
                 }
 
                 var existing = fi.GetValue(_subscribedBuzz) as Delegate;
-                var combined = Delegate.Combine(existing, ours);
-                fi.SetValue(_subscribedBuzz, combined);
-                _masterTapDelegate = ours;
+                fi.SetValue(_subscribedBuzz, Delegate.Combine(existing, fieldDelegate));
+                _masterTapDelegate = fieldDelegate;
+                _masterTapViaEvent = false;
                 _masterTapHooked   = true;
             }
             catch (Exception ex)
@@ -263,14 +287,28 @@ namespace WDE.PedalProfiler2
                     System.Reflection.BindingFlags.Public    |
                     System.Reflection.BindingFlags.NonPublic |
                     System.Reflection.BindingFlags.Instance;
-                var fi = _subscribedBuzz.GetType().GetField("MasterTap", FLAGS);
-                if (fi == null || _masterTapDelegate == null) return;
-                var existing  = fi.GetValue(_subscribedBuzz) as Delegate;
-                var remaining = Delegate.Remove(existing, _masterTapDelegate);
-                fi.SetValue(_subscribedBuzz, remaining);
+                var t = _subscribedBuzz.GetType();
+
+                if (_masterTapViaEvent)
+                {
+                    var ev = t.GetEvent("MasterTap", FLAGS);
+                    if (ev != null && _masterTapDelegate != null)
+                        ev.RemoveEventHandler(_subscribedBuzz, _masterTapDelegate);
+                }
+                else
+                {
+                    var fi = t.GetField("MasterTap", FLAGS);
+                    if (fi != null && _masterTapDelegate != null)
+                    {
+                        var existing  = fi.GetValue(_subscribedBuzz) as Delegate;
+                        var remaining = Delegate.Remove(existing, _masterTapDelegate);
+                        fi.SetValue(_subscribedBuzz, remaining);
+                    }
+                }
             }
             catch { }
             _masterTapHooked   = false;
+            _masterTapViaEvent = false;
             _masterTapDelegate = null;
         }
 
@@ -1485,9 +1523,17 @@ namespace WDE.PedalProfiler2
 
             long now = Environment.TickCount64;
 
-            // Detect significant budget change (>10%) — that's a buffer-size change
+            // Detect a real ASIO buffer-size change (vs. fill-thread chunk
+            // jitter). With AudioBufferFillThread on, the fill thread reads the
+            // ring buffer in variable blocks, so BudgetMs wobbles ~15-20% even
+            // when the ASIO buffer is unchanged. Real buffer changes are large
+            // (typically ≥2× — e.g. 256↔512↔1024), so a 35% threshold cleanly
+            // separates a deliberate change from fill-thread noise. (Note: with
+            // the fill thread active, the Sweep tracks fill-chunk cadence, not
+            // the ASIO buffer — it's only a true buffer-size map with the fill
+            // thread OFF.)
             bool changed = _sweepLastBudget > 0
-                         && Math.Abs(budget - _sweepLastBudget) / _sweepLastBudget > 0.10;
+                         && Math.Abs(budget - _sweepLastBudget) / _sweepLastBudget > 0.35;
 
             if (changed || _sweepLastBudget == 0)
             {
@@ -2199,12 +2245,21 @@ namespace WDE.PedalProfiler2
                 if (Array.IndexOf(s.ActiveMachines, _selectedName) >= 0) activeCount++;
             }
 
-            // Compute interval statistics — if intervals are tightly clustered
-            // (CV < ~0.1) the spikes are periodic; that's a strong signal of
-            // a regular host event (timer, DPC, etc.) vs random scheduling noise.
-            // Spikes are stored newest-first, so consecutive deltas come out
-            // negative — take abs so the stats are meaningful regardless.
+            // Compute interval statistics. IMPORTANT: the Spikes[] ring is
+            // cooldown-limited (≤1 capture per SPIKE_COOLDOWN_MS = 500 ms in the
+            // machine). When real overruns are frequent, recorded intervals
+            // collapse to ~the cooldown and masquerade as "periodic" with σ≈0.
+            // That's an artifact, not a real timer. Detect this by comparing the
+            // mean interval to the cooldown, and when overruns are cooldown-
+            // limited, report the TRUE overrun rate from SpikeRawTotal instead.
+            const double SPIKE_COOLDOWN_MS = 500.0;   // must match machine
             string intervalSummary = "";
+
+            // True overrun rate (no cooldown) — the honest signal
+            double rawRatePerSec = (snap.ElapsedSec > 0.5)
+                                 ? snap.SpikeRawTotal / snap.ElapsedSec
+                                 : 0;
+
             if (snap.Spikes.Length >= 2)
             {
                 double sum = 0, sumSq = 0; int n = 0;
@@ -2219,9 +2274,26 @@ namespace WDE.PedalProfiler2
                     double var  = (sumSq / n) - (mean * mean);
                     double std  = var > 0 ? Math.Sqrt(var) : 0;
                     double cv   = mean > 0 ? std / mean : 0;
-                    string regularity = cv < 0.15 ? "periodic" : cv < 0.40 ? "semi-periodic" : "irregular";
-                    intervalSummary = $"  ·  intervals μ={mean:F0}ms σ={std:F0}ms ({regularity})";
+
+                    // Cooldown-limited if the mean recorded interval is within
+                    // ~25% of the cooldown floor — recorded cadence is dominated
+                    // by the throttle, so the periodicity stat is meaningless.
+                    bool cooldownLimited = mean <= SPIKE_COOLDOWN_MS * 1.25;
+
+                    if (cooldownLimited && rawRatePerSec > 0)
+                    {
+                        intervalSummary = $"  ·  overruns {rawRatePerSec:F0}/s (recorded list capped at 1/{SPIKE_COOLDOWN_MS/1000:F1}s — intervals not meaningful)";
+                    }
+                    else
+                    {
+                        string regularity = cv < 0.15 ? "periodic" : cv < 0.40 ? "semi-periodic" : "irregular";
+                        intervalSummary = $"  ·  intervals μ={mean:F0}ms σ={std:F0}ms ({regularity})";
+                    }
                 }
+            }
+            else if (rawRatePerSec > 0)
+            {
+                intervalSummary = $"  ·  overruns {rawRatePerSec:F0}/s";
             }
 
             if (withData == 0)
@@ -2525,7 +2597,14 @@ namespace WDE.PedalProfiler2
                 string mt   = es.Multithreading      ? "MT"          : "single-thread";
                 string pmm  = es.ProcessMutedMachines ? "process-muted" : "skip-muted";
                 string llgc = es.LowLatencyGC        ? "lowGC"       : "normalGC";
-                _engineSettingsText.Text = $"Engine: {es.Priority} · {mt} · {pmm} · {llgc}";
+                // SubTickResolution (1827+): "Lower"/"Low" reduce sub-tick CPU
+                // load — directly relevant to per-chunk overhead. Only shown when
+                // the build exposes it and it's not the default "Normal".
+                string subtick = (!string.IsNullOrEmpty(es.SubTickResolution) && es.SubTickResolution != "Normal")
+                               ? $" · subtick={es.SubTickResolution}"
+                               : "";
+                string fill = es.AudioBufferFillThread ? " · fillthread" : "";
+                _engineSettingsText.Text = $"Engine: {es.Priority} · {mt} · {pmm} · {llgc}{subtick}{fill}";
 
                 // Flag the audio priority — non-AllFocusOnAudio profiles correlate
                 // with scheduling-induced stalls when the box is under CPU pressure.
@@ -2617,6 +2696,8 @@ namespace WDE.PedalProfiler2
             public bool   Multithreading;
             public bool   ProcessMutedMachines;
             public bool   LowLatencyGC;
+            public string SubTickResolution = "";   // 1827+: "Lower"/"Low" reduce sub-tick CPU
+            public bool   AudioBufferFillThread;     // 1827+: background ring-buffer fill thread
         }
 
         // Resolved once on first successful read, then cached.
@@ -2625,6 +2706,9 @@ namespace WDE.PedalProfiler2
         System.Reflection.PropertyInfo? _esMultithreadingProp;
         System.Reflection.PropertyInfo? _esProcessMutedProp;
         System.Reflection.PropertyInfo? _esLowLatencyGCProp;
+        System.Reflection.PropertyInfo? _esSubTickResProp;
+        System.Reflection.PropertyInfo? _esFillThreadProp;
+        bool _esPropsResolved;
         bool _engineSettingsResolveFailed;
 
         EngineSettingsInfo? ReadEngineSettings()
@@ -2646,13 +2730,16 @@ namespace WDE.PedalProfiler2
                 var es = _engineSettingsField.GetValue(buzz);
                 if (es == null) return null;
 
-                if (_esPriorityProp == null)
+                if (!_esPropsResolved)
                 {
                     var t = es.GetType();
                     _esPriorityProp       = t.GetProperty("PriorityProfile");
                     _esMultithreadingProp = t.GetProperty("Multithreading");
                     _esProcessMutedProp   = t.GetProperty("ProcessMutedMachines");
                     _esLowLatencyGCProp   = t.GetProperty("LowLatencyGC");
+                    _esSubTickResProp     = t.GetProperty("SubTickResolution");  // may be null on older builds
+                    _esFillThreadProp     = t.GetProperty("AudioBufferFillThread"); // 1827+; null on older
+                    _esPropsResolved = true;
                 }
 
                 var info = new EngineSettingsInfo();
@@ -2660,6 +2747,8 @@ namespace WDE.PedalProfiler2
                 try { info.Multithreading       = (bool)(_esMultithreadingProp?.GetValue(es) ?? false); } catch { }
                 try { info.ProcessMutedMachines = (bool)(_esProcessMutedProp?.GetValue(es) ?? false); } catch { }
                 try { info.LowLatencyGC         = (bool)(_esLowLatencyGCProp?.GetValue(es) ?? false); } catch { }
+                try { info.SubTickResolution    = _esSubTickResProp?.GetValue(es)?.ToString() ?? ""; } catch { }
+                try { info.AudioBufferFillThread = (bool)(_esFillThreadProp?.GetValue(es) ?? false); } catch { }
                 return info;
             }
             catch
