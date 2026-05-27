@@ -552,6 +552,7 @@ namespace WDE.PedalProfiler2
 
         TextBlock   _globalStatusText= null!;
         TextBlock   _engineSettingsText = null!;
+        TextBlock?  _dumpStatusText;
         TextBlock   _gcStatusText    = null!;
 
         Button      _profileAllBtn   = null!;
@@ -1082,18 +1083,20 @@ namespace WDE.PedalProfiler2
             // exposing properly (e.g. per-machine Work() timing if it exists).
             root.Children.Add(SectionHeader("Diagnostics"));
             var diagRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
-            var dumpBtn = MakeButton("Dump Internals (DC)", 150);
-            dumpBtn.Click += (_, __) => DumpInternalsToDC();
+            var dumpBtn = MakeButton("Dump → File + Clipboard", 200);
+            dumpBtn.Click += (_, __) => DumpInternals();
             diagRow.Children.Add(dumpBtn);
-            diagRow.Children.Add(new TextBlock
+            _dumpStatusText = new TextBlock
             {
-                Text       = "writes to ReBuzz Debug Console",
+                Text       = "writes timestamped .txt to Documents\\ReBuzz PP2 Dumps + clipboard",
                 Foreground = BrushSubText,
                 FontFamily = Mono,
                 FontSize   = 10,
                 VerticalAlignment = VerticalAlignment.Center,
+                TextWrapping = TextWrapping.Wrap,
                 Margin     = new Thickness(8, 0, 0, 0)
-            });
+            };
+            diagRow.Children.Add(_dumpStatusText);
             root.Children.Add(diagRow);
 
             // ── Global status footer ─────────────────────────────────────────
@@ -3256,19 +3259,27 @@ namespace WDE.PedalProfiler2
         // Debug Console window.
         //
         // No engine state is modified. Read-only inspection.
-        void DumpInternalsToDC()
+        // Builds the same reflection dump as before but routes it to a
+        // timestamped file under Documents\ReBuzz PP2 Dumps\ AND the system
+        // clipboard, wrapped in a markdown code fence so it pastes cleanly
+        // into chat without extra reformatting. A one-line status (path +
+        // size) appears next to the button and is also echoed to the DC so
+        // the action leaves a trace there for anyone watching the DC live.
+        //
+        // No engine state is modified. Read-only inspection.
+        void DumpInternals()
         {
             var buzz = _subscribedBuzz;
             if (buzz == null) return;
 
-            void Line(string s)
-            {
-                try { buzz.DCWriteLine(s); } catch { }
-            }
+            var sb = new System.Text.StringBuilder(64 * 1024);
+            void Line(string s) => sb.AppendLine(s);
 
+            // Markdown fence so paste-into-chat is one keystroke
+            Line("```");
             Line("");
             Line("════════════════════════════════════════════════════════════");
-            Line("Pedal Profiler2 — reflection dump  " + DateTime.Now.ToString("HH:mm:ss"));
+            Line("Pedal Profiler2 — reflection dump  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             Line("════════════════════════════════════════════════════════════");
 
             DumpObject(buzz,                "IBuzz (Global.Buzz)",                 Line, maxDepth: 1);
@@ -3301,23 +3312,17 @@ namespace WDE.PedalProfiler2
             Line("");
             Line("──── PHASE 2: drill-down on perf/engine objects ────");
 
-            // Engine-level performance — what the host itself tracks for total CPU
             DumpObject(GetProp(buzz, "PerformanceCurrent"),
                        "BuzzPerformanceData (buzz.PerformanceCurrent)", Line, maxDepth: 1);
             DumpObject(GetProp(buzz, "PerformanceData"),
                        "BuzzPerformanceData (buzz.PerformanceData)",    Line, maxDepth: 1);
 
-            // The audio engine itself — buffer state, driver-side stats
             DumpObject(GetProp(buzz, "AudioEngine"),
                        "AudioEngine (buzz.AudioEngine)",                Line, maxDepth: 1);
 
-            // Engine settings — likely buffer size, sample-rate config, etc.
             DumpObject(GetField(buzz, "engineSettings"),
                        "EngineSettings (buzz.engineSettings)",          Line, maxDepth: 1);
 
-            // PER-MACHINE PERFORMANCE — the headline target. If this carries a
-            // work-time field, we can replace the entire mute-based measurement
-            // apparatus with direct reads.
             if (_selectedIMachine != null)
             {
                 DumpObject(GetProp(_selectedIMachine, "PerformanceData"),
@@ -3328,7 +3333,6 @@ namespace WDE.PedalProfiler2
                            Line, maxDepth: 1);
             }
 
-            // Sample one Spike2Record so the user can see what we capture
             var snap = _machine?.Snapshot;
             if (snap?.Spikes != null && snap.Spikes.Length > 0)
             {
@@ -3338,13 +3342,73 @@ namespace WDE.PedalProfiler2
             Line("════════════════════════════════════════════════════════════");
             Line("end reflection dump");
             Line("");
+            Line("```");
 
-            // Open the debug console so the user sees the output without hunting
+            string dump = sb.ToString();
+            int kb = (dump.Length + 1023) / 1024;
+
+            // --- Write to file -------------------------------------------------
+            string? filePath = null;
+            string? fileError = null;
             try
             {
-                System.Windows.Application.Current?.Dispatcher?.BeginInvoke(
-                    (Action)(() => { try { buzz.ExecuteCommand(BuzzCommand.DebugConsole); } catch { } }));
-            } catch { }
+                string folder = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                    "ReBuzz PP2 Dumps");
+                System.IO.Directory.CreateDirectory(folder);
+                filePath = System.IO.Path.Combine(folder,
+                    $"pp2_dump_{DateTime.Now:yyyy-MM-dd_HHmmss}.txt");
+                System.IO.File.WriteAllText(filePath, dump);
+            }
+            catch (Exception ex)
+            {
+                fileError = $"{ex.GetType().Name}: {ex.Message}";
+                filePath = null;
+            }
+
+            // --- Copy to clipboard --------------------------------------------
+            bool clipboardOk = false;
+            string? clipboardError = null;
+            try
+            {
+                System.Windows.Clipboard.SetText(dump);
+                clipboardOk = true;
+            }
+            catch (Exception ex)
+            {
+                clipboardError = $"{ex.GetType().Name}: {ex.Message}";
+            }
+
+            // --- Surface status -----------------------------------------------
+            string msg;
+            Brush brush;
+            if (filePath != null && clipboardOk)
+            {
+                msg   = $"OK · {kb} KB → clipboard + {filePath}";
+                brush = BrushOk;
+            }
+            else if (filePath != null)
+            {
+                msg   = $"file OK ({kb} KB): {filePath} — clipboard FAILED: {clipboardError}";
+                brush = BrushWarn;
+            }
+            else if (clipboardOk)
+            {
+                msg   = $"clipboard OK ({kb} KB) — file FAILED: {fileError}";
+                brush = BrushWarn;
+            }
+            else
+            {
+                msg   = $"FAILED — file: {fileError} · clipboard: {clipboardError}";
+                brush = BrushBad;
+            }
+
+            if (_dumpStatusText != null)
+            {
+                _dumpStatusText.Text       = msg;
+                _dumpStatusText.Foreground = brush;
+            }
+            try { buzz.DCWriteLine($"[PP2] dump: {msg}"); } catch { }
         }
 
         // Reflection helpers — best-effort public-property and private-field access
