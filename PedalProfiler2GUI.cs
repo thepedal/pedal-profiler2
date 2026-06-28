@@ -553,6 +553,7 @@ namespace WDE.PedalProfiler2
         TextBlock   _globalStatusText= null!;
         TextBlock   _engineSettingsText = null!;
         TextBlock?  _dumpStatusText;
+        CheckBox?   _verboseDumpCheckbox;
         TextBlock   _gcStatusText    = null!;
 
         Button      _profileAllBtn   = null!;
@@ -1086,6 +1087,17 @@ namespace WDE.PedalProfiler2
             var dumpBtn = MakeButton("Dump → File + Clipboard", 200);
             dumpBtn.Click += (_, __) => DumpInternals();
             diagRow.Children.Add(dumpBtn);
+            _verboseDumpCheckbox = new CheckBox
+            {
+                Content    = "verbose (Phase 2 reflection)",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin     = new Thickness(10, 0, 0, 0),
+                IsChecked  = false
+            };
+            diagRow.Children.Add(_verboseDumpCheckbox);
             _dumpStatusText = new TextBlock
             {
                 Text       = "writes timestamped .txt to Documents\\ReBuzz PP2 Dumps + clipboard",
@@ -2701,6 +2713,9 @@ namespace WDE.PedalProfiler2
             public bool   LowLatencyGC;
             public string SubTickResolution = "";   // 1827+: "Lower"/"Low" reduce sub-tick CPU
             public bool   AudioBufferFillThread;     // 1827+: background ring-buffer fill thread
+            public bool   MachineDelayCompensation;
+            public bool   AccurateBPM;
+            public bool   SubTickTiming;
         }
 
         // Resolved once on first successful read, then cached.
@@ -2711,6 +2726,9 @@ namespace WDE.PedalProfiler2
         System.Reflection.PropertyInfo? _esLowLatencyGCProp;
         System.Reflection.PropertyInfo? _esSubTickResProp;
         System.Reflection.PropertyInfo? _esFillThreadProp;
+        System.Reflection.PropertyInfo? _esDelayCompProp;
+        System.Reflection.PropertyInfo? _esAccurateBpmProp;
+        System.Reflection.PropertyInfo? _esSubTickTimingProp;
         bool _esPropsResolved;
         bool _engineSettingsResolveFailed;
 
@@ -2742,6 +2760,9 @@ namespace WDE.PedalProfiler2
                     _esLowLatencyGCProp   = t.GetProperty("LowLatencyGC");
                     _esSubTickResProp     = t.GetProperty("SubTickResolution");  // may be null on older builds
                     _esFillThreadProp     = t.GetProperty("AudioBufferFillThread"); // 1827+; null on older
+                    _esDelayCompProp      = t.GetProperty("MachineDelayCompensation");
+                    _esAccurateBpmProp    = t.GetProperty("AccurateBPM");
+                    _esSubTickTimingProp  = t.GetProperty("SubTickTiming");
                     _esPropsResolved = true;
                 }
 
@@ -2752,6 +2773,9 @@ namespace WDE.PedalProfiler2
                 try { info.LowLatencyGC         = (bool)(_esLowLatencyGCProp?.GetValue(es) ?? false); } catch { }
                 try { info.SubTickResolution    = _esSubTickResProp?.GetValue(es)?.ToString() ?? ""; } catch { }
                 try { info.AudioBufferFillThread = (bool)(_esFillThreadProp?.GetValue(es) ?? false); } catch { }
+                try { info.MachineDelayCompensation = (bool)(_esDelayCompProp?.GetValue(es) ?? false); } catch { }
+                try { info.AccurateBPM           = (bool)(_esAccurateBpmProp?.GetValue(es) ?? false); } catch { }
+                try { info.SubTickTiming         = (bool)(_esSubTickTimingProp?.GetValue(es) ?? false); } catch { }
                 return info;
             }
             catch
@@ -3246,27 +3270,24 @@ namespace WDE.PedalProfiler2
 
 
         // ═════════════════════════════════════════════════════════════════════
-        // Reflection-dump diagnostic
+        // Reflection-dump diagnostic (v2 — self-describing, percentile-based)
         // ═════════════════════════════════════════════════════════════════════
-        // Empirical map of what's reachable on ReBuzz internals. Walks:
-        //   - IBuzz (Global.Buzz) — engine root
-        //   - Selected IMachine cast to its concrete MachineCore type
-        //   - One of the selected machine's IParameters cast to ParameterCore
-        //   - The Snapshot from this Profiler2Machine instance (sanity check)
+        // Produces a single paste-and-read diagnostic dump with every metric
+        // needed for host-overhead / per-chunk optimisation work. Implements
+        // the v2 spec (Notes_PedalProfiler2 §13 / Notes_Core §41):
+        //   - Self-describing run context (transport, graph, settings)
+        //   - Per-chunk OtherMs percentiles from the machine-side ring
+        //   - Peak classification (TRANSIENT vs SUSTAINED) via 2×p99 sparsity
+        //   - driver:chunk ratio cadence-inflation flag
+        //   - Per-machine ENGINE% table from the existing MachinePerformanceData
+        //     polling (no manual QPC arithmetic, no 1-s blocking pause)
+        //   - GC summary, spike attribution with full ActiveMachines lists
+        //   - Trust-vs-artifact legend at the foot
+        //   - Machine-readable single line for diff/plot of a dump sequence
+        //   - Optional Phase 2 raw reflection (verbose checkbox)
         //
-        // Output via DCWriteLine, one line per call (it doesn't handle
-        // multi-line strings — see Tracker §7.5). View in ReBuzz under the
-        // Debug Console window.
-        //
-        // No engine state is modified. Read-only inspection.
-        // Builds the same reflection dump as before but routes it to a
-        // timestamped file under Documents\ReBuzz PP2 Dumps\ AND the system
-        // clipboard, wrapped in a markdown code fence so it pastes cleanly
-        // into chat without extra reformatting. A one-line status (path +
-        // size) appears next to the button and is also echoed to the DC so
-        // the action leaves a trace there for anyone watching the DC live.
-        //
-        // No engine state is modified. Read-only inspection.
+        // Output: markdown-fenced text to file + system clipboard. No engine
+        // state is modified. Read-only inspection.
         void DumpInternals()
         {
             var buzz = _subscribedBuzz;
@@ -3274,74 +3295,307 @@ namespace WDE.PedalProfiler2
 
             var sb = new System.Text.StringBuilder(64 * 1024);
             void Line(string s) => sb.AppendLine(s);
+            bool verbose = _verboseDumpCheckbox?.IsChecked == true;
 
-            // Markdown fence so paste-into-chat is one keystroke
-            Line("```");
-            Line("");
-            Line("════════════════════════════════════════════════════════════");
-            Line("Pedal Profiler2 — reflection dump  " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
-            Line("════════════════════════════════════════════════════════════");
-
-            DumpObject(buzz,                "IBuzz (Global.Buzz)",                 Line, maxDepth: 1);
-            DumpObject(buzz.Song,           "IBuzz.Song",                          Line, maxDepth: 1);
-
-            if (_selectedIMachine != null)
-            {
-                DumpObject(_selectedIMachine, $"IMachine '{_selectedIMachine.Name}'", Line, maxDepth: 1);
-
-                // First parameter of group 1 (globals), if any
-                try
-                {
-                    var groups = _selectedIMachine.ParameterGroups;
-                    if (groups != null && groups.Count >= 2 && groups[1].Parameters.Count > 0)
-                    {
-                        var p = groups[1].Parameters[0];
-                        DumpObject(p, $"IParameter '{p.Name}'", Line, maxDepth: 1);
-                    }
-                } catch { }
-            }
-
-            if (_machine != null)
-            {
-                DumpObject(_machine.Snapshot, "Profile2Snapshot (this v2 instance)", Line, maxDepth: 1);
-            }
-
-            // ─────────────────────────────────────────────────────────────────
-            // PHASE 2: drill into perf/engine objects revealed by phase 1
-            // ─────────────────────────────────────────────────────────────────
-            Line("");
-            Line("──── PHASE 2: drill-down on perf/engine objects ────");
-
-            DumpObject(GetProp(buzz, "PerformanceCurrent"),
-                       "BuzzPerformanceData (buzz.PerformanceCurrent)", Line, maxDepth: 1);
-            DumpObject(GetProp(buzz, "PerformanceData"),
-                       "BuzzPerformanceData (buzz.PerformanceData)",    Line, maxDepth: 1);
-
-            DumpObject(GetProp(buzz, "AudioEngine"),
-                       "AudioEngine (buzz.AudioEngine)",                Line, maxDepth: 1);
-
-            DumpObject(GetField(buzz, "engineSettings"),
-                       "EngineSettings (buzz.engineSettings)",          Line, maxDepth: 1);
-
-            if (_selectedIMachine != null)
-            {
-                DumpObject(GetProp(_selectedIMachine, "PerformanceData"),
-                           $"MachinePerformanceData '{_selectedIMachine.Name}'.PerformanceData",
-                           Line, maxDepth: 1);
-                DumpObject(GetProp(_selectedIMachine, "PerformanceDataCurrent"),
-                           $"MachinePerformanceData '{_selectedIMachine.Name}'.PerformanceDataCurrent",
-                           Line, maxDepth: 1);
-            }
-
+            // ── Collect once ────────────────────────────────────────────────
             var snap = _machine?.Snapshot;
+            var es   = ReadEngineSettings();
+
+            double budgetMs  = snap?.BudgetMs  ?? 0;
+            int    srate     = snap?.SampleRate ?? 0;
+            double elapsedS  = snap?.ElapsedSec ?? 0;
+            int    chunkSmp  = (budgetMs > 0 && srate > 0)
+                                 ? (int)Math.Round(budgetMs * srate / 1000.0) : 0;
+
+            // ASIO buffer (real read from registry; "unknown" if we can't)
+            var (asioBufSmp, driverLabel) = TryReadAsioBufferSize(buzz);
+            double? driverChunkRatio = (asioBufSmp.HasValue && chunkSmp > 0)
+                                         ? (double?)((double)asioBufSmp.Value / chunkSmp) : null;
+            bool cadenceInflated = driverChunkRatio.HasValue && driverChunkRatio.Value > 3.0;
+
+            // Per-chunk OtherMs ring → percentiles
+            double[] otherMs = Array.Empty<double>();
+            long     otherTotal = 0;
+            try { _machine?.CopyRecentOtherMs(out otherMs, out otherTotal); } catch { otherMs = Array.Empty<double>(); }
+            var pct = BuildPercentiles(otherMs);
+            var (peakClass, peakOverCount, peakRateText) =
+                ClassifyPeak(otherMs, pct.p99, elapsedS);
+
+            // Graph topology counts
+            var graph = WalkGraphCounts(buzz);
+
+            // Per-machine cost (uses existing UpdateEngineCost EMA — no blocking)
+            var perMachine = CollectPerMachineCosts(buzz, budgetMs);
+
+            // SubTickSize (IBuzz public field, 260 on 1827)
+            int subTickSize = 0;
+            try
+            {
+                var fi = buzz.GetType().GetField("SubTickSize",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.Instance);
+                if (fi != null) subTickSize = (int)(fi.GetValue(buzz) ?? 0);
+            } catch { }
+
+            // GC values (read fresh; the running UI tick has been polling these too)
+            int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+            double heapMB = 0;
+            try { heapMB = GC.GetTotalMemory(false) / 1024.0 / 1024.0; } catch { }
+            string g2AgoStr = "—";
+            int? g2AgoSec = null;
+            if (_gcLastGen2Ms >= 0)
+            {
+                long ms = Environment.TickCount64 - _gcLastGen2Ms;
+                g2AgoSec = (int)(ms / 1000);
+                g2AgoStr = ms < 1000 ? $"{ms} ms" : $"{ms / 1000.0:F1} s";
+            }
+
+            // Transport + song name + BPM
+            bool playing = false; int bpm = 0; string songName = "(unsaved)";
+            try { playing = buzz.Playing; } catch { }
+            try { bpm = buzz.BPM; } catch { }
+            try { songName = buzz.Song?.SongName ?? "(unsaved)"; } catch { }
+            if (string.IsNullOrEmpty(songName)) songName = "(unsaved)";
+            else { try { songName = System.IO.Path.GetFileName(songName); } catch { } }
+
+            double engineTotalMs  = perMachine.Sum(p => double.IsNaN(p.msPerBuf) ? 0 : p.msPerBuf);
+            double engineTotalPct = (budgetMs > 0) ? engineTotalMs / budgetMs * 100.0 : 0;
+            double unaccountedMs  = Math.Max(0, budgetMs - engineTotalMs);
+            double unaccountedPct = (budgetMs > 0) ? unaccountedMs / budgetMs * 100.0 : 0;
+            int    managedCount   = perMachine.Count(p => !p.isNative);
+            int    nativeCount    = perMachine.Count(p =>  p.isNative);
+
+            // ── EMIT ────────────────────────────────────────────────────────
+            Line("```");
+
+            // Header
+            int buildNumber = 0;
+            try
+            {
+                var pi = buzz.GetType().GetProperty("BuildNumber");
+                if (pi != null) buildNumber = (int)(pi.GetValue(buzz) ?? 0);
+            } catch { }
+            string buildStr = buildNumber > 0 ? $"ReBuzz Build {buildNumber}" : "ReBuzz Build ?";
+            Line($"═══ PP2 DUMP  {DateTime.Now:yyyy-MM-dd HH:mm:ss} │ PP2 v1.9.2 │ {buildStr} ═══");
+            Line("");
+
+            // Machine-readable single line (versioned, parseable)
+            string mline = BuildMachineLine(
+                version: "PP2 v1",
+                t: elapsedS, chunkMs: budgetMs,
+                p50: pct.p50, p90: pct.p90, p99: pct.p99, max: pct.max,
+                dropPct: PercentDropouts(snap), wdrop: snap?.WindowDropouts ?? 0,
+                ovrPerSec: OverrunRate(snap), peakClass: peakClass,
+                g2: g2, g2age: g2AgoSec,
+                engPct: engineTotalPct, unaccPct: unaccountedPct,
+                play: playing, bpm: bpm,
+                graph: graph,
+                asioBufSmp: asioBufSmp, chunkSmp: chunkSmp,
+                ratio: driverChunkRatio,
+                qpcHz: (long)Stopwatch.Frequency);
+            Line(mline);
+            Line("");
+
+            // ── RUN CONTEXT ─────────────────────────────────────────────
+            Line("── RUN CONTEXT ─────────────────────────────────────────────");
+            Line(P("QPC freq (Stopwatch.Frequency)", $"{Stopwatch.Frequency} Hz"));
+            Line(P("SampleRate",                     $"{srate}"));
+            Line(P("BPM",                            $"{bpm}"));
+            Line(P("Transport",                      playing ? "PLAYING" : "STOPPED",
+                                                     $"(Playing={playing})"));
+            Line(P("Song",                           songName));
+            string asioStr = asioBufSmp.HasValue
+                ? $"{asioBufSmp.Value} smp ({(asioBufSmp.Value * 1000.0 / Math.Max(1, srate)):F2} ms)"
+                : "unknown";
+            Line(P($"{driverLabel} buffer (driver)", asioStr,
+                   asioBufSmp.HasValue ? "[from registry]" : "[no registry entry — driver pre-config]"));
+            Line(P("Chunk period (BudgetMs)",
+                   chunkSmp > 0 ? $"{budgetMs:F2} ms (~{chunkSmp} smp)" : $"{budgetMs:F2} ms"));
+            if (driverChunkRatio.HasValue)
+                Line(P("driver : chunk ratio",
+                       $"{driverChunkRatio.Value:F2}",
+                       cadenceInflated
+                         ? "[>3 ⇒ dropout%/peak cadence-inflated, Core §34.1]"
+                         : "[<3 ⇒ drop% and max are not cadence-inflated]"));
+            else
+                Line(P("driver : chunk ratio", "na", "(ASIO buffer unknown)"));
+            Line(P("Engine settings", FormatEngineSettings(es, subTickSize)));
+            Line(P("Graph", FormatGraphCounts(graph)));
+            Line("");
+
+            // ── PER-CHUNK TIMING ────────────────────────────────────────
+            Line("── PER-CHUNK TIMING (trustworthy distribution) ─────────────");
+            if (pct.n > 0)
+            {
+                Line(P("OtherMs",
+                       $"p50={pct.p50:F2}  p90={pct.p90:F2}  p99={pct.p99:F2}  max={pct.max:F2}",
+                       $"(n={pct.n} chunks, window≈{(pct.n * Math.Max(budgetMs,0.001) / 1000.0):F1}s)"));
+                Line(P("peak class", peakClass, peakRateText));
+            }
+            else
+            {
+                Line(P("OtherMs", "(no samples yet — too early?)"));
+            }
+            Line(P("AvgOtherMs",
+                   snap != null ? $"{snap.AvgOtherMs:F2}" : "—",
+                   "[≈ Budget = utilisation artifact; NOT cpu]"));
+            Line(P("CpuPct",
+                   snap != null ? $"{snap.CpuPct:F3}" : "—",
+                   "[buffer-cycle utilisation; ~100% when healthy; ignore]"));
+            Line("");
+
+            // ── DROPOUTS / OVERRUNS ─────────────────────────────────────
+            Line("── DROPOUTS / OVERRUNS ─────────────────────────────────────");
+            int wdrop = snap?.WindowDropouts ?? 0;
+            Line(P("WindowDropouts", $"{wdrop}", "← rare-vs-recurring discriminator (current window only)"));
+            if (snap != null && snap.TotalBuffers > 0)
+            {
+                double dropPct = snap.TotalDropouts * 100.0 / snap.TotalBuffers;
+                string cad = cadenceInflated ? "  [cadence-inflated; ratio>3]" : "";
+                Line(P("TotalDropouts / TotalBuffers",
+                       $"{snap.TotalDropouts} / {snap.TotalBuffers} = {dropPct:F2}%{cad}"));
+            }
+            else
+                Line(P("TotalDropouts / TotalBuffers", "—"));
+            double rate = OverrunRate(snap);
+            Line(P("Overrun rate", $"{rate:F1}/s",
+                   "[SpikeRawTotal/ElapsedSec — a TALLY, not distinct events]"));
+            Line(P("ElapsedSec", $"{elapsedS:F1}"));
+            Line("");
+
+            // ── COST DECOMPOSITION ──────────────────────────────────────
+            Line("── COST DECOMPOSITION ──────────────────────────────────────");
+            Line(P("Engine Total",
+                   $"{engineTotalMs:F3} ms ({engineTotalPct:F1}%)",
+                   $"n={managedCount} managed (+{nativeCount} native)"));
+            string verdict = unaccountedPct > 90 ? "→ HOST OVERHEAD DOMINATES (>90%)"
+                           : unaccountedPct > 50 ? "→ host overhead significant"
+                           : unaccountedPct > 20 ? "→ machines and host comparable"
+                           : "→ machine work dominates";
+            Line(P("Unaccounted",
+                   $"{unaccountedMs:F3} ms ({unaccountedPct:F1}%)",
+                   verdict));
+            Line("");
+
+            // ── PER-MACHINE COST ────────────────────────────────────────
+            Line("── PER-MACHINE COST (continuous EMA from MachinePerformanceData) ─");
+            if (perMachine.Count > 0)
+            {
+                Line(string.Format("  {0,-30} {1,-5} {2,8}   {3,8}", "machine", "type", "ENGINE%", "ms/buf"));
+                Line("  " + new string('─', 56));
+                foreach (var p in perMachine)
+                {
+                    if (p.isNative)
+                        Line(string.Format("  {0,-30} {1,-5} {2,8}   {3,8}",
+                            Trunc(p.name, 30), p.type, "n/a", "(native)"));
+                    else if (p.isUnavailable)
+                    {
+                        string label = p.statusTag == "idle" ? "(idle)" : "(warming up)";
+                        Line(string.Format("  {0,-30} {1,-5} {2,8}   {3,8}",
+                            Trunc(p.name, 30), p.type, "—", label));
+                    }
+                    else
+                        Line(string.Format("  {0,-30} {1,-5} {2,8:F2} {3,8:F3}",
+                            Trunc(p.name, 30), p.type, p.enginePct, p.msPerBuf));
+                }
+            }
+            else
+            {
+                Line("  (no machines)");
+            }
+            Line("");
+
+            // ── GC ──────────────────────────────────────────────────────
+            Line("── GC ──────────────────────────────────────────────────────");
+            string g2AgePhrase = _gcLastGen2Ms >= 0
+                ? $"last G2 {g2AgoStr} ago"
+                : "last G2 not observed since PP2 loaded";
+            Line(string.Format("  G0={0} ({1:F1}/s)  G1={2} ({3:F2}/s)  G2={4} ({5:F2}/s)  heap {6:F1} MB  {7}",
+                g0, _gcG0PerSec, g1, _gcG1PerSec, g2, _gcG2PerSec, heapMB, g2AgePhrase));
+            Line("");
+
+            // ── SPIKES ──────────────────────────────────────────────────
+            Line("── SPIKES (recorded ring, full ActiveMachines, uncapped attribution) ─");
+            Line(string.Format("  rate {0:F1}/s  (recorded list capped at 1 / 0.5 s — intervals NOT meaningful, §6.4)", rate));
             if (snap?.Spikes != null && snap.Spikes.Length > 0)
             {
-                DumpObject((object)snap.Spikes[0], "Spike2Record [0]", Line, maxDepth: 1);
+                int i = 0;
+                Spike2Record prev = default;
+                bool havePrev = false;
+                foreach (var sp in snap.Spikes)
+                {
+                    string dprev = havePrev
+                        ? $"Δprev={(prev.ElapsedSec - sp.ElapsedSec)*1000:F0}ms"
+                        : "Δprev=—";
+                    string active = (sp.ActiveMachines == null || sp.ActiveMachines.Length == 0)
+                        ? "(none)"
+                        : string.Join(",", sp.ActiveMachines);
+                    Line(string.Format("  [{0}] t={1:F2}  spike={2:F2}ms  budget={3:F2}  {4}  active=[{5}]",
+                        i, sp.ElapsedSec, sp.SpikeMs, sp.BudgetMs, dprev, active));
+                    prev = sp; havePrev = true; i++;
+                }
+            }
+            else
+            {
+                Line("  (no spikes recorded)");
+            }
+            Line("");
+
+            // ── PHASE 2 raw reflection (verbose only) ───────────────────
+            if (verbose)
+            {
+                Line("── PHASE 2: raw reflection (verbose) ───────────────────────");
+                DumpObject(buzz,      "IBuzz (Global.Buzz)",                 Line, maxDepth: 1);
+                DumpObject(buzz.Song, "IBuzz.Song",                          Line, maxDepth: 1);
+
+                if (_selectedIMachine != null)
+                {
+                    DumpObject(_selectedIMachine, $"IMachine '{_selectedIMachine.Name}'", Line, maxDepth: 1);
+                    try
+                    {
+                        var groups = _selectedIMachine.ParameterGroups;
+                        if (groups != null && groups.Count >= 2 && groups[1].Parameters.Count > 0)
+                        {
+                            var p = groups[1].Parameters[0];
+                            DumpObject(p, $"IParameter '{p.Name}'", Line, maxDepth: 1);
+                        }
+                    } catch { }
+                }
+                if (_machine != null)
+                    DumpObject(_machine.Snapshot, "Profile2Snapshot (this v2 instance)", Line, maxDepth: 1);
+
+                Line("");
+                DumpObject(GetProp(buzz, "PerformanceCurrent"),
+                           "BuzzPerformanceData (buzz.PerformanceCurrent)", Line, maxDepth: 1);
+                DumpObject(GetProp(buzz, "PerformanceData"),
+                           "BuzzPerformanceData (buzz.PerformanceData)",    Line, maxDepth: 1);
+                DumpObject(GetProp(buzz, "AudioEngine"),
+                           "AudioEngine (buzz.AudioEngine)",                Line, maxDepth: 1);
+                DumpObject(GetField(buzz, "engineSettings"),
+                           "EngineSettings (buzz.engineSettings)",          Line, maxDepth: 1);
+                if (_selectedIMachine != null)
+                {
+                    DumpObject(GetProp(_selectedIMachine, "PerformanceData"),
+                               $"MachinePerformanceData '{_selectedIMachine.Name}'.PerformanceData",
+                               Line, maxDepth: 1);
+                    DumpObject(GetProp(_selectedIMachine, "PerformanceDataCurrent"),
+                               $"MachinePerformanceData '{_selectedIMachine.Name}'.PerformanceDataCurrent",
+                               Line, maxDepth: 1);
+                }
+                var snap2 = _machine?.Snapshot;
+                if (snap2?.Spikes != null && snap2.Spikes.Length > 0)
+                    DumpObject((object)snap2.Spikes[0], "Spike2Record [0]", Line, maxDepth: 1);
+                Line("");
             }
 
-            Line("════════════════════════════════════════════════════════════");
-            Line("end reflection dump");
+            // ── Trust-vs-artifact legend (always at foot) ───────────────
+            Line("── LEGEND ──────────────────────────────────────────────────");
+            Line("  TRUST:  OtherMs p99/percentiles · WindowDropouts · GC last-G2 age · per-machine ENGINE% · Unaccounted% · ears");
+            Line("  LABEL:  AvgOtherMs / CpuPct = buffer-cycle utilisation (≈100% healthy AND saturated) — not CPU");
+            Line("  LABEL:  TotalDropouts% & max OtherMs — cadence-inflated when driver:chunk > 3");
+            Line("  NOTE:   Overrun rate / SpikeRawTotal = per-cycle tally, NOT distinct large events");
             Line("");
+            Line("end PP2 dump");
             Line("```");
 
             string dump = sb.ToString();
@@ -3409,6 +3663,288 @@ namespace WDE.PedalProfiler2
                 _dumpStatusText.Foreground = brush;
             }
             try { buzz.DCWriteLine($"[PP2] dump: {msg}"); } catch { }
+        }
+
+        // ── Dump helpers ────────────────────────────────────────────────────
+
+        // Indent the "key value [trail]" rows uniformly.
+        static string P(string key, string value, string trail = "")
+        {
+            // Indented row in the spec layout: 2-space indent, key padded to 32,
+            // value, then optional trailing comment / context.
+            if (string.IsNullOrEmpty(trail))
+                return $"  {key,-32} {value}";
+            return $"  {key,-32} {value}   {trail}";
+        }
+
+        static string Trunc(string s, int max)
+            => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s.Substring(0, max - 1) + "…");
+
+        static double PercentDropouts(Profile2Snapshot? s)
+            => (s != null && s.TotalBuffers > 0) ? s.TotalDropouts * 100.0 / s.TotalBuffers : 0;
+
+        static double OverrunRate(Profile2Snapshot? s)
+            => (s != null && s.ElapsedSec > 0) ? s.SpikeRawTotal / s.ElapsedSec : 0;
+
+        // Reads ReBuzz's stored ASIO/WASAPI buffer size from the registry. ReBuzz
+        // writes/reads this at engine init (AudioEngine.cs:99). There is no live
+        // property exposing the running buffer size, so the registry is the
+        // ground truth for "what the user selected last". Returns (null,
+        // driverLabel) if the registry entry is absent (e.g. driver never
+        // configured in this install) — Core §34.5/§41.2 forbid inferring from
+        // Work() timing.
+        (int? sizeSmp, string driverLabel) TryReadAsioBufferSize(IBuzz buzz)
+        {
+            string label = "Driver";
+            string subKey;
+            try
+            {
+                string drv = (buzz.SelectedAudioDriver ?? "").Trim();
+                if (drv.StartsWith("ASIO ", StringComparison.OrdinalIgnoreCase))
+                {
+                    label  = "ASIO";
+                    subKey = @"Software\ReBuzz\ASIO";
+                }
+                else if (drv.IndexOf("WASAPI", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    label  = "WASAPI";
+                    subKey = @"Software\ReBuzz\WASAPI";
+                }
+                else
+                {
+                    return (null, "Driver");
+                }
+            }
+            catch { return (null, "Driver"); }
+
+            try
+            {
+                using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(subKey);
+                if (k == null) return (null, label);
+                var v = k.GetValue("BufferSize");
+                if (v is int i && i > 0) return (i, label);
+                if (v != null && int.TryParse(v.ToString(), out int parsed) && parsed > 0)
+                    return (parsed, label);
+            }
+            catch { }
+            return (null, label);
+        }
+
+        struct PercentileResult { public int n; public double p50, p90, p99, max; }
+
+        static PercentileResult BuildPercentiles(double[] values)
+        {
+            var r = new PercentileResult();
+            if (values == null || values.Length == 0) return r;
+            // Sort a copy so the snapshot order isn't disturbed (it isn't reused here,
+            // but keep the convention safe).
+            var sorted = (double[])values.Clone();
+            Array.Sort(sorted);
+            r.n   = sorted.Length;
+            r.p50 = Quantile(sorted, 0.50);
+            r.p90 = Quantile(sorted, 0.90);
+            r.p99 = Quantile(sorted, 0.99);
+            r.max = sorted[sorted.Length - 1];
+            return r;
+        }
+
+        static double Quantile(double[] sorted, double q)
+        {
+            // Nearest-rank quantile — good enough for diagnostic percentiles.
+            if (sorted.Length == 0) return 0;
+            if (q <= 0) return sorted[0];
+            if (q >= 1) return sorted[sorted.Length - 1];
+            int idx = (int)Math.Ceiling(q * sorted.Length) - 1;
+            if (idx < 0) idx = 0;
+            if (idx >= sorted.Length) idx = sorted.Length - 1;
+            return sorted[idx];
+        }
+
+        // §6.4's cooldown skepticism generalised from spike-rate to the peak.
+        // Counts how many chunks in the window exceeded 2×p99; few sparse hits =
+        // TRANSIENT, many = SUSTAINED. Bound at "≈ 1 / N s" for transients so the
+        // rarity is concrete.
+        static (string label, int count, string rate) ClassifyPeak(double[] values, double p99, double elapsedS)
+        {
+            if (values == null || values.Length == 0) return ("UNKNOWN", 0, "(no samples)");
+            double thr = 2.0 * p99;
+            if (!(thr > 0)) thr = double.PositiveInfinity;
+            int over = 0;
+            for (int i = 0; i < values.Length; i++) if (values[i] > thr) over++;
+            // "Sparse" if <0.5% of samples (≈ 1 in 200 chunks)
+            double sparseLimit = Math.Max(2, values.Length * 0.005);
+            string label = over <= sparseLimit ? "TRANSIENT" : "SUSTAINED";
+            string rateText;
+            if (over == 0)
+                rateText = $"(max ≤ 2×p99 — no extremes in n={values.Length} chunks)";
+            else if (label == "TRANSIENT" && elapsedS > 0)
+                rateText = $"(max exceeded 2×p99 on {over}/{values.Length} chunks ≈ 1 / {elapsedS / over:F0} s)";
+            else
+                rateText = $"({over}/{values.Length} chunks exceeded 2×p99 — recurring cost)";
+            return (label, over, rateText);
+        }
+
+        struct GraphCounts
+        {
+            public int total, active, muted, bypassed, soloed, control, native;
+        }
+
+        static GraphCounts WalkGraphCounts(IBuzz buzz)
+        {
+            var g = new GraphCounts();
+            try
+            {
+                var ms = buzz.Song?.Machines;
+                if (ms == null) return g;
+                foreach (var m in ms)
+                {
+                    g.total++;
+                    bool muted = false, bypassed = false, soloed = false, ctrl = false, isNative = false;
+                    try { muted    = m.IsMuted; } catch { }
+                    try { bypassed = m.IsBypassed; } catch { }
+                    try { soloed   = m.IsSoloed; } catch { }
+                    try { ctrl     = m.IsControlMachine; } catch { }
+                    try { isNative = (m.ManagedMachine == null); } catch { }
+                    if (muted)    g.muted++;
+                    if (bypassed) g.bypassed++;
+                    if (soloed)   g.soloed++;
+                    if (ctrl)     g.control++;
+                    if (isNative) g.native++;
+                    // "active" = not muted and not bypassed (still produces output)
+                    if (!muted && !bypassed) g.active++;
+                }
+            } catch { }
+            return g;
+        }
+
+        static string FormatGraphCounts(GraphCounts g)
+            => $"{g.total} machines  ·  active {g.active} · muted {g.muted} · bypassed {g.bypassed} · soloed {g.soloed} · control {g.control} · native {g.native}";
+
+        static string FormatEngineSettings(EngineSettingsInfo? es, int subTickSize)
+        {
+            if (es == null) return "(unavailable)";
+            string sub = string.IsNullOrEmpty(es.SubTickResolution) ? "n/a" : es.SubTickResolution;
+            return $"FillThread={B(es.AudioBufferFillThread)}  SubTickRes={sub}  SubTickSize={subTickSize}  MT={B(es.Multithreading)}\n" +
+                   $"                                   ProcMuted={B(es.ProcessMutedMachines)}  DelayComp={B(es.MachineDelayCompensation)}  LowLatGC={B(es.LowLatencyGC)}  AccurateBPM={B(es.AccurateBPM)}\n" +
+                   $"                                   SubTickTiming={B(es.SubTickTiming)}  Prio={es.Priority}";
+            static string B(bool b) => b ? "ON" : "OFF";
+        }
+
+        struct PerMachineRow
+        {
+            public string name;
+            public string type;       // "GEN"/"FX"/"CTRL"
+            public double enginePct;  // smoothed
+            public double msPerBuf;   // smoothed
+            public bool   isNative;
+            public bool   isUnavailable;
+            public string statusTag;  // "ok"/"idle"/"warmup"  (for the "(idle)" vs "(warming up)" display)
+        }
+
+        // Walks all machines, reads the existing smoothed (ENGINE%, ms/buf) from
+        // _enginePerf (populated by the running UI tick), and returns rows sorted
+        // descending by enginePct. Skips Master and control machines from the
+        // sortable cost ranking (the spec excludes them) but counts them inline
+        // so totals are honest.
+        List<PerMachineRow> CollectPerMachineCosts(IBuzz buzz, double budgetMs)
+        {
+            var rows = new List<PerMachineRow>();
+            try
+            {
+                var ms = buzz.Song?.Machines;
+                if (ms == null) return rows;
+                foreach (var m in ms)
+                {
+                    if (m == null) continue;
+                    string typeTag = TypeTag(m);
+                    if (typeTag == "CTRL") continue;       // exclude control machines from cost ranking
+
+                    bool isNative = false;
+                    try { isNative = (m.ManagedMachine == null); } catch { }
+
+                    if (isNative)
+                    {
+                        rows.Add(new PerMachineRow {
+                            name = m.Name, type = typeTag,
+                            enginePct = 0, msPerBuf = double.NaN,
+                            isNative = true, isUnavailable = false });
+                        continue;
+                    }
+
+                    var cost = UpdateEngineCost(m, budgetMs);
+                    double enginePct = 0, msPerBuf = double.NaN;
+                    string statusTag = "warmup";   // "ok" / "idle" / "warmup"
+
+                    if (cost != null)
+                    {
+                        enginePct = cost.Value.cpuPct;
+                        msPerBuf  = cost.Value.msPerBuffer;
+                        statusTag = "ok";
+                    }
+                    else if (_enginePerf.TryGetValue(m.Name, out var st))
+                    {
+                        if (!double.IsNaN(st.SmoothedCpuPct))
+                        {
+                            // Have prior smoothed data but this tick happened
+                            // to read no progress — use the smoothed state.
+                            enginePct = st.SmoothedCpuPct;
+                            msPerBuf  = st.SmoothedMsPerBuffer;
+                            statusTag = "ok";
+                        }
+                        else if (st.HasPrior)
+                        {
+                            // Entry seeded across many UI ticks but every read
+                            // had deltaSamp == 0 — the machine's SampleCount
+                            // hasn't advanced. Likely an idle generator (e.g.
+                            // a sample player waiting for a trigger) or one
+                            // ReBuzz doesn't populate perfData for. Distinct
+                            // from "no data yet" so we don't mislead the reader.
+                            statusTag = "idle";
+                        }
+                    }
+
+                    rows.Add(new PerMachineRow {
+                        name = m.Name, type = typeTag,
+                        enginePct = enginePct, msPerBuf = msPerBuf,
+                        isNative = false,
+                        isUnavailable = statusTag != "ok",
+                        statusTag = statusTag });
+                }
+            } catch { }
+            // Sort: managed-cost rows desc, then unavailable, then native
+            rows.Sort((a, b) =>
+            {
+                int sa = a.isNative ? 2 : a.isUnavailable ? 1 : 0;
+                int sb = b.isNative ? 2 : b.isUnavailable ? 1 : 0;
+                if (sa != sb) return sa.CompareTo(sb);
+                return b.enginePct.CompareTo(a.enginePct);
+            });
+            return rows;
+        }
+
+        static string BuildMachineLine(
+            string version, double t, double chunkMs,
+            double p50, double p90, double p99, double max,
+            double dropPct, int wdrop, double ovrPerSec, string peakClass,
+            int g2, int? g2age,
+            double engPct, double unaccPct,
+            bool play, int bpm,
+            GraphCounts graph,
+            int? asioBufSmp, int chunkSmp, double? ratio,
+            long qpcHz)
+        {
+            string asio  = asioBufSmp.HasValue ? asioBufSmp.Value.ToString() : "unknown";
+            string ratioS = ratio.HasValue ? $"{ratio.Value:F2}" : "na";
+            string g2ageS = g2age.HasValue ? g2age.Value.ToString() : "na";
+            return $"{version} | t={t:F1} | chunk={chunkMs:F2} | " +
+                   $"other_p50={p50:F2} p90={p90:F2} p99={p99:F2} max={max:F2} | " +
+                   $"drop={dropPct:F2}% wdrop={wdrop} ovr={ovrPerSec:F1}/s peak={peakClass} | " +
+                   $"g2={g2} g2age={g2ageS} | " +
+                   $"eng={engPct:F1}% unacc={unaccPct:F1}% | " +
+                   $"play={(play ? 1 : 0)} bpm={bpm} | " +
+                   $"mach={graph.total}(a{graph.active} m{graph.muted} b{graph.bypassed} s{graph.soloed} c{graph.control} n{graph.native}) | " +
+                   $"asio={asio} chunk_smp={chunkSmp} ratio={ratioS} | " +
+                   $"qpc={qpcHz}";
         }
 
         // Reflection helpers — best-effort public-property and private-field access

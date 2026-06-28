@@ -106,6 +106,32 @@ namespace WDE.PedalProfiler2
             => _activeMachinesPublished = names ?? Array.Empty<string>();
 
 
+        // ─── Per-chunk OtherMs snapshot (UI thread reads at dump time) ───────
+        // Returns the most recent up to OTHER_RING_SIZE samples in chronological
+        // order (oldest first) along with the all-time total write count so the
+        // caller can tell if the ring is full (n == OTHER_RING_SIZE) or partial
+        // (n == totalWrites < OTHER_RING_SIZE). Audio thread keeps writing
+        // during the copy; we tolerate up to one torn 64-bit slot on the
+        // boundary since percentiles over thousands of samples are robust to
+        // single-sample noise.
+        public void CopyRecentOtherMs(out double[] copy, out long totalWrites)
+        {
+            long total = _otherRingTotal;   // aligned 64-bit read, atomic on x64
+            int n = (int)Math.Min(total, OTHER_RING_SIZE);
+            var dst = new double[n];
+            double freq = Stopwatch.Frequency;
+            if (freq <= 0) freq = 1;
+            long start = total - n;
+            for (int i = 0; i < n; i++)
+            {
+                long ticks = _otherTicksRing[(int)((start + i) % OTHER_RING_SIZE)];
+                dst[i] = ticks / freq * 1000.0;
+            }
+            copy = dst;
+            totalWrites = total;
+        }
+
+
         // ─── Cached sample rate (audio thread writes, UI thread reads) ───────
         volatile int _cachedSampleRate;
 
@@ -128,6 +154,18 @@ namespace WDE.PedalProfiler2
         // ─── All-time totals ─────────────────────────────────────────────────
         long _totalBuffers;
         long _totalDropouts;
+
+
+        // ─── Per-chunk OtherTicks ring (for percentiles at dump time, §5.1) ──
+        // Fixed-size circular buffer of every chunk's "other" duration in QPC
+        // ticks. Audio thread appends each Work() call; GUI thread copies a
+        // stable enough snapshot at dump time via CopyRecentOtherMs(). For
+        // percentiles over thousands of samples, a one-sample torn read on the
+        // boundary is noise — we don't lock. Size = 4096 ≈ 16 s at ~250
+        // chunks/s, plenty for the optimisation A/B loop.
+        const int OTHER_RING_SIZE = 4096;
+        readonly long[] _otherTicksRing = new long[OTHER_RING_SIZE];
+        long _otherRingTotal = 0;   // monotonic write count; index = total % SIZE
 
 
         // ─── Baseline period low-pass (128-buffer time constant) ─────────────
@@ -240,6 +278,10 @@ namespace WDE.PedalProfiler2
 
                 if (otherTicks  < 0) otherTicks  = 0;
                 if (periodTicks <= 0) periodTicks = 1;
+
+                // ── Per-chunk ring append (for dump-time percentiles, §5.1) ─
+                _otherTicksRing[(int)(_otherRingTotal % OTHER_RING_SIZE)] = otherTicks;
+                _otherRingTotal++;
 
                 // ── Accumulate for window averaging ─────────────────────────
                 _sumOtherTicks  += otherTicks;
