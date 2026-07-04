@@ -2716,6 +2716,8 @@ namespace WDE.PedalProfiler2
             public bool   MachineDelayCompensation;
             public bool   AccurateBPM;
             public bool   SubTickTiming;
+            public bool   UseCachedWorkOrder;        // 1834+ (#111): cached topological work order
+            public bool   HasUseCachedWorkOrder;     // false on older builds where property doesn't exist
         }
 
         // Resolved once on first successful read, then cached.
@@ -2729,6 +2731,7 @@ namespace WDE.PedalProfiler2
         System.Reflection.PropertyInfo? _esDelayCompProp;
         System.Reflection.PropertyInfo? _esAccurateBpmProp;
         System.Reflection.PropertyInfo? _esSubTickTimingProp;
+        System.Reflection.PropertyInfo? _esUseCachedWorkOrderProp;   // 1834+; null on older builds
         bool _esPropsResolved;
         bool _engineSettingsResolveFailed;
 
@@ -2763,6 +2766,7 @@ namespace WDE.PedalProfiler2
                     _esDelayCompProp      = t.GetProperty("MachineDelayCompensation");
                     _esAccurateBpmProp    = t.GetProperty("AccurateBPM");
                     _esSubTickTimingProp  = t.GetProperty("SubTickTiming");
+                    _esUseCachedWorkOrderProp = t.GetProperty("UseCachedWorkOrder");   // 1834+; null on older
                     _esPropsResolved = true;
                 }
 
@@ -2776,6 +2780,15 @@ namespace WDE.PedalProfiler2
                 try { info.MachineDelayCompensation = (bool)(_esDelayCompProp?.GetValue(es) ?? false); } catch { }
                 try { info.AccurateBPM           = (bool)(_esAccurateBpmProp?.GetValue(es) ?? false); } catch { }
                 try { info.SubTickTiming         = (bool)(_esSubTickTimingProp?.GetValue(es) ?? false); } catch { }
+                if (_esUseCachedWorkOrderProp != null)
+                {
+                    try
+                    {
+                        info.UseCachedWorkOrder = (bool)(_esUseCachedWorkOrderProp.GetValue(es) ?? false);
+                        info.HasUseCachedWorkOrder = true;
+                    }
+                    catch { info.HasUseCachedWorkOrder = false; }
+                }
                 return info;
             }
             catch
@@ -3313,6 +3326,11 @@ namespace WDE.PedalProfiler2
                                          ? (double?)((double)asioBufSmp.Value / chunkSmp) : null;
             bool cadenceInflated = driverChunkRatio.HasValue && driverChunkRatio.Value > 3.0;
 
+            // AudioThreads count (registry; default 4). Not a live property on
+            // ReBuzzCore, but affects barrier / straggler behaviour and needs to
+            // be per-dump reproducible.
+            int? audioThreads = TryReadAudioThreads();
+
             // Per-chunk OtherMs ring → percentiles
             double[] otherMs = Array.Empty<double>();
             long     otherTotal = 0;
@@ -3376,12 +3394,16 @@ namespace WDE.PedalProfiler2
                 if (pi != null) buildNumber = (int)(pi.GetValue(buzz) ?? 0);
             } catch { }
             string buildStr = buildNumber > 0 ? $"ReBuzz Build {buildNumber}" : "ReBuzz Build ?";
-            Line($"═══ PP2 DUMP  {DateTime.Now:yyyy-MM-dd HH:mm:ss} │ PP2 v1.9.2 │ {buildStr} ═══");
+            Line($"═══ PP2 DUMP  {DateTime.Now:yyyy-MM-dd HH:mm:ss} │ PP2 v1.9.3 │ {buildStr} ═══");
             Line("");
 
-            // Machine-readable single line (versioned, parseable)
+            // Machine-readable single line (versioned, parseable).
+            // Bumped v1 → v2 in PP2 v1.9.3: added `ci=` (cadence-inflated flag
+            // for the whole dropout family) and `athreads=` (AudioThreads from
+            // registry). Diffing scripts targeting v1 should update the field
+            // set OR pin to v1-format legacy dumps.
             string mline = BuildMachineLine(
-                version: "PP2 v1",
+                version: "PP2 v2",
                 t: elapsedS, chunkMs: budgetMs,
                 p50: pct.p50, p90: pct.p90, p99: pct.p99, max: pct.max,
                 dropPct: PercentDropouts(snap), wdrop: snap?.WindowDropouts ?? 0,
@@ -3392,6 +3414,7 @@ namespace WDE.PedalProfiler2
                 graph: graph,
                 asioBufSmp: asioBufSmp, chunkSmp: chunkSmp,
                 ratio: driverChunkRatio,
+                cadenceInflated: cadenceInflated, audioThreads: audioThreads,
                 qpcHz: (long)Stopwatch.Frequency);
             Line(mline);
             Line("");
@@ -3415,21 +3438,39 @@ namespace WDE.PedalProfiler2
                 Line(P("driver : chunk ratio",
                        $"{driverChunkRatio.Value:F2}",
                        cadenceInflated
-                         ? "[>3 ⇒ dropout%/peak cadence-inflated, Core §34.1]"
-                         : "[<3 ⇒ drop% and max are not cadence-inflated]"));
+                         ? "[>3 ⇒ WHOLE dropout family cadence-inflated: TotalDropouts%, WindowDropouts, overruns/s, p99/max, PeakOtherMs — Core §34.1, PP2 §9.5]"
+                         : "[<3 ⇒ dropout family not cadence-inflated (still fill-thread-schedule-influenced when FillThread=ON)]"));
             else
                 Line(P("driver : chunk ratio", "na", "(ASIO buffer unknown)"));
+            Line(P("AudioThreads (registry)",
+                   audioThreads.HasValue ? audioThreads.Value.ToString() : "unknown",
+                   audioThreads.HasValue
+                     ? "[HKCU\\Software\\ReBuzz\\Settings\\AudioThreads]"
+                     : "[no registry entry — default 4]"));
             Line(P("Engine settings", FormatEngineSettings(es, subTickSize)));
             Line(P("Graph", FormatGraphCounts(graph)));
             Line("");
 
             // ── PER-CHUNK TIMING ────────────────────────────────────────
-            Line("── PER-CHUNK TIMING (trustworthy distribution) ─────────────");
+            Line("── PER-CHUNK TIMING (p50/p90 trust; p99/max symptom, see caveats) ─");
             if (pct.n > 0)
             {
                 Line(P("OtherMs",
                        $"p50={pct.p50:F2}  p90={pct.p90:F2}  p99={pct.p99:F2}  max={pct.max:F2}",
                        $"(n={pct.n} chunks, window≈{(pct.n * Math.Max(budgetMs,0.001) / 1000.0):F1}s)"));
+                // p99/max caveat — fill-thread-schedule under FillThread=ON (PP2 §14.2)
+                // AND cadence-inflated at ratio > 3 (Core §34.1, PP2 §9.5). Both are
+                // symptom metrics under those regimes, not cost metrics.
+                bool fillOn = es?.AudioBufferFillThread == true;
+                if (fillOn && cadenceInflated)
+                    Line(P("  ↳ p99/max caveat", "fill-thread-schedule AND cadence-inflated",
+                           "[both regimes active — symptom only]"));
+                else if (fillOn)
+                    Line(P("  ↳ p99/max caveat", "fill-thread-schedule",
+                           "[FillThread=ON: p99/max reflect fill-thread sleep gaps, not chunk cost — PP2 §14.2]"));
+                else if (cadenceInflated)
+                    Line(P("  ↳ p99/max caveat", "cadence-inflated",
+                           "[ratio>3: p99/max over-report vs driver deadline — PP2 §9.5]"));
                 Line(P("peak class", peakClass, peakRateText));
             }
             else
@@ -3447,7 +3488,10 @@ namespace WDE.PedalProfiler2
             // ── DROPOUTS / OVERRUNS ─────────────────────────────────────
             Line("── DROPOUTS / OVERRUNS ─────────────────────────────────────");
             int wdrop = snap?.WindowDropouts ?? 0;
-            Line(P("WindowDropouts", $"{wdrop}", "← rare-vs-recurring discriminator (current window only)"));
+            string wdropTrail = cadenceInflated
+                ? "  [cadence-inflated; ratio>3 — internal-budget reference, not ASIO deadline; PP2 §10]"
+                : "← rare-vs-recurring discriminator (current window only)";
+            Line(P("WindowDropouts", $"{wdrop}", wdropTrail));
             if (snap != null && snap.TotalBuffers > 0)
             {
                 double dropPct = snap.TotalDropouts * 100.0 / snap.TotalBuffers;
@@ -3458,8 +3502,10 @@ namespace WDE.PedalProfiler2
             else
                 Line(P("TotalDropouts / TotalBuffers", "—"));
             double rate = OverrunRate(snap);
-            Line(P("Overrun rate", $"{rate:F1}/s",
-                   "[SpikeRawTotal/ElapsedSec — a TALLY, not distinct events]"));
+            string rateTrail = cadenceInflated
+                ? "[SpikeRawTotal/ElapsedSec — a TALLY, not distinct events]  [cadence-inflated; ratio>3]"
+                : "[SpikeRawTotal/ElapsedSec — a TALLY, not distinct events]";
+            Line(P("Overrun rate", $"{rate:F1}/s", rateTrail));
             Line(P("ElapsedSec", $"{elapsedS:F1}"));
             Line("");
 
@@ -3590,10 +3636,13 @@ namespace WDE.PedalProfiler2
 
             // ── Trust-vs-artifact legend (always at foot) ───────────────
             Line("── LEGEND ──────────────────────────────────────────────────");
-            Line("  TRUST:  OtherMs p99/percentiles · WindowDropouts · GC last-G2 age · per-machine ENGINE% · Unaccounted% · ears");
+            Line("  TRUST:  ears · OtherMs p50/p90 · per-machine ENGINE% · GC last-G2 age · Unaccounted%");
+            Line("  DISTRUST as audible-dropout proxies (all cadence-inflate together at driver:chunk > 3):");
+            Line("     TotalDropouts%, WindowDropouts, overruns/s, OtherMs p99/max, PeakOtherMs");
+            Line("     — internal-budget reference, not ASIO deadline (perf handoff §10, PP2 §9.5, §14.2)");
             Line("  LABEL:  AvgOtherMs / CpuPct = buffer-cycle utilisation (≈100% healthy AND saturated) — not CPU");
-            Line("  LABEL:  TotalDropouts% & max OtherMs — cadence-inflated when driver:chunk > 3");
-            Line("  NOTE:   Overrun rate / SpikeRawTotal = per-cycle tally, NOT distinct large events");
+            Line("  LABEL:  p99 / max under FillThread=ON reflect fill-thread sleep gaps, not chunk cost (PP2 §14.2)");
+            Line("  NOTE:   Overrun rate / SpikeRawTotal = per-cycle TALLY, NOT distinct large events");
             Line("");
             Line("end PP2 dump");
             Line("```");
@@ -3730,6 +3779,28 @@ namespace WDE.PedalProfiler2
             return (null, label);
         }
 
+        // Reads ReBuzz's stored AudioThreads count from the registry
+        // (HKCU\Software\ReBuzz\Settings\AudioThreads). ReBuzz reads this at
+        // engine init in AudioEngine.cs / CommonAudioProvider.cs (default 4);
+        // it's the count of worker threads used by the multi-thread audio graph
+        // dispatch. Directly affects barrier / straggler behaviour on wide songs
+        // (perf handoff §1, §6.2), so surface it per-dump for reproducibility.
+        // Returns null if the registry entry is absent (never opened Prefs).
+        int? TryReadAudioThreads()
+        {
+            try
+            {
+                using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\ReBuzz\Settings");
+                if (k == null) return null;
+                var v = k.GetValue("AudioThreads");
+                if (v is int i && i > 0) return i;
+                if (v != null && int.TryParse(v.ToString(), out int parsed) && parsed > 0)
+                    return parsed;
+            }
+            catch { }
+            return null;
+        }
+
         struct PercentileResult { public int n; public double p50, p90, p99, max; }
 
         static PercentileResult BuildPercentiles(double[] values)
@@ -3824,9 +3895,13 @@ namespace WDE.PedalProfiler2
         {
             if (es == null) return "(unavailable)";
             string sub = string.IsNullOrEmpty(es.SubTickResolution) ? "n/a" : es.SubTickResolution;
+            // UseCachedWorkOrder is 1834+ (#111). Show it inline if the property
+            // exists on the running build; omit silently on older builds so the
+            // dump stays clean across preview versions.
+            string cwo = es.HasUseCachedWorkOrder ? $"  CachedWorkOrder={B(es.UseCachedWorkOrder)}" : "";
             return $"FillThread={B(es.AudioBufferFillThread)}  SubTickRes={sub}  SubTickSize={subTickSize}  MT={B(es.Multithreading)}\n" +
                    $"                                   ProcMuted={B(es.ProcessMutedMachines)}  DelayComp={B(es.MachineDelayCompensation)}  LowLatGC={B(es.LowLatencyGC)}  AccurateBPM={B(es.AccurateBPM)}\n" +
-                   $"                                   SubTickTiming={B(es.SubTickTiming)}  Prio={es.Priority}";
+                   $"                                   SubTickTiming={B(es.SubTickTiming)}  Prio={es.Priority}{cwo}";
             static string B(bool b) => b ? "ON" : "OFF";
         }
 
@@ -3931,19 +4006,25 @@ namespace WDE.PedalProfiler2
             bool play, int bpm,
             GraphCounts graph,
             int? asioBufSmp, int chunkSmp, double? ratio,
+            bool cadenceInflated, int? audioThreads,
             long qpcHz)
         {
             string asio  = asioBufSmp.HasValue ? asioBufSmp.Value.ToString() : "unknown";
             string ratioS = ratio.HasValue ? $"{ratio.Value:F2}" : "na";
             string g2ageS = g2age.HasValue ? g2age.Value.ToString() : "na";
+            string ci     = cadenceInflated ? "1" : "0";
+            string ath    = audioThreads.HasValue ? audioThreads.Value.ToString() : "na";
+            // ci=1 means the whole dropout family (drop/wdrop/ovr/p99/max) is
+            // cadence-inflated at this song's driver:chunk ratio > 3. A diffing
+            // script should suppress those columns from comparison when ci=1.
             return $"{version} | t={t:F1} | chunk={chunkMs:F2} | " +
                    $"other_p50={p50:F2} p90={p90:F2} p99={p99:F2} max={max:F2} | " +
-                   $"drop={dropPct:F2}% wdrop={wdrop} ovr={ovrPerSec:F1}/s peak={peakClass} | " +
+                   $"drop={dropPct:F2}% wdrop={wdrop} ovr={ovrPerSec:F1}/s peak={peakClass} ci={ci} | " +
                    $"g2={g2} g2age={g2ageS} | " +
                    $"eng={engPct:F1}% unacc={unaccPct:F1}% | " +
                    $"play={(play ? 1 : 0)} bpm={bpm} | " +
                    $"mach={graph.total}(a{graph.active} m{graph.muted} b{graph.bypassed} s{graph.soloed} c{graph.control} n{graph.native}) | " +
-                   $"asio={asio} chunk_smp={chunkSmp} ratio={ratioS} | " +
+                   $"asio={asio} chunk_smp={chunkSmp} ratio={ratioS} athreads={ath} | " +
                    $"qpc={qpcHz}";
         }
 
