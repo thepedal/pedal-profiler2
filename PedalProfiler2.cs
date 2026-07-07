@@ -28,11 +28,14 @@
 //       drives a Profile-All mode that cycles through every machine.
 
 using System;
+using System.Collections.Generic;
 using Buzz.MachineInterface;
+using BuzzGUI.Common;
 using BuzzGUI.Interfaces;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Windows;
 
 namespace WDE.PedalProfiler2
 {
@@ -82,6 +85,39 @@ namespace WDE.PedalProfiler2
                  MaxTracks = 0, InputCount = 0, OutputCount = 0)]
     public class Profiler2Machine : IBuzzMachine
     {
+        // ─── Version (single source of truth) ────────────────────────────────
+        // Referenced from the reflection dump header and the About window.
+        // Keeps the dump, About dialog, and git tag from drifting apart.
+        internal const string Version = "1.9.5";
+
+
+        // ─── ReBuzz context menu — About entry ───────────────────────────────
+        // ReBuzz picks up an optional `Commands` property on the machine class
+        // (duck-typed, per IBuzzMachine.cs comment at line 31) and injects the
+        // entries into the machine's right-click menu in the Machine View.
+        public IEnumerable<IMenuItem> Commands
+        {
+            get
+            {
+                yield return new MenuItemVM()
+                {
+                    Text = "About...",
+                    Command = new SimpleCommand()
+                    {
+                        CanExecuteDelegate = p => true,
+                        ExecuteDelegate = p => MessageBox.Show(
+                            $"Pedal Profiler2   v{Version}\n\n" +
+                            "Per-machine CPU inspector for ReBuzz.\n" +
+                            "Cost measurement, spike attribution, dump export.\n\n" +
+                            "github.com/thepedal/pedal-profiler2\n" +
+                            "MIT License",
+                            "About Pedal Profiler2")
+                    }
+                };
+            }
+        }
+
+
         // ─── Host ────────────────────────────────────────────────────────────
         IBuzzMachineHost _host;
         public IBuzzMachineHost Host { get => _host; set => _host = value; }

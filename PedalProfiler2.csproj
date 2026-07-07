@@ -29,6 +29,10 @@
       <HintPath>C:\Program Files\ReBuzz\BuzzGUI.Interfaces.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <Reference Include="BuzzGUI.Common">
+      <HintPath>C:\Program Files\ReBuzz\BuzzGUI.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <!-- Deploy the .dll to the ReBuzz gear folder (Build §1.3) -->

@@ -3456,7 +3456,7 @@ namespace WDE.PedalProfiler2
                 if (pi != null) buildNumber = (int)(pi.GetValue(buzz) ?? 0);
             } catch { }
             string buildStr = buildNumber > 0 ? $"ReBuzz Build {buildNumber}" : "ReBuzz Build ?";
-            Line($"═══ PP2 DUMP  {DateTime.Now:yyyy-MM-dd HH:mm:ss} │ PP2 v1.9.3 │ {buildStr} ═══");
+            Line($"═══ PP2 DUMP  {DateTime.Now:yyyy-MM-dd HH:mm:ss} │ PP2 v{Profiler2Machine.Version} │ {buildStr} ═══");
             Line("");
 
             // Machine-readable single line (versioned, parseable).
