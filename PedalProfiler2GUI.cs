@@ -2583,6 +2583,8 @@ namespace WDE.PedalProfiler2
         // ═════════════════════════════════════════════════════════════════════
         void RefreshGlobalStatus(Profile2Snapshot snap)
         {
+            SampleTrueDropouts();
+
             if (!snap.IsValid)
             {
                 _globalStatusText.Text = "Global: warming up…";
@@ -2590,11 +2592,25 @@ namespace WDE.PedalProfiler2
             else
             {
                 int spikeCount = snap.Spikes?.Length ?? 0;
+
+                // TRUE deadline-referenced dropouts (Option 2 v2): device
+                // callbacks whose wall-time overran the buffer deadline — actual
+                // missed deadlines, valid whether or not the fill thread is on.
+                // The budget-relative snap.TotalDropouts is the legacy fallback.
+                string dropSeg;
+                if (_trueDropoutAvailable)
+                    dropSeg = $"{_sessionResets} driver reset(s) (true dropout)";
+                else
+                    dropSeg = $"{snap.TotalDropouts} dropouts (budget)";
+
                 _globalStatusText.Text =
-                    $"Global: {snap.CpuPct:F1}% CPU  ·  {snap.TotalDropouts} dropouts  ·  {spikeCount} spike(s) logged";
-                _globalStatusText.Foreground = snap.CpuPct >= 90 ? BrushBad
-                                             : snap.CpuPct >= 70 ? BrushWarn
-                                             : BrushSubText;
+                    $"Global: {snap.CpuPct:F1}% CPU  ·  {dropSeg}  ·  {spikeCount} spike(s) logged";
+                // Colour bad if any missed deadline this session, else fall back to CPU.
+                _globalStatusText.Foreground =
+                      (_trueDropoutAvailable && _sessionResets > 0) ? BrushBad
+                    : snap.CpuPct >= 90 ? BrushBad
+                    : snap.CpuPct >= 70 ? BrushWarn
+                    : BrushSubText;
             }
 
             // Engine settings — read from buzz.engineSettings each tick so toggles
@@ -2734,6 +2750,52 @@ namespace WDE.PedalProfiler2
         System.Reflection.PropertyInfo? _esUseCachedWorkOrderProp;   // 1834+; null on older builds
         bool _esPropsResolved;
         bool _engineSettingsResolveFailed;
+
+        // ─── Deadline-referenced dropout counters (PP2 Option 2) ─────────────
+        // TRUE dropouts from ReBuzzCore (public prop DriverResetCount — 1835+;
+        // null on older builds). This is the device driver's own reset/xrun
+        // notification (ASIO DriverResetRequest / WASAPI PlaybackStopped-with-
+        // exception) — the only real, device-reported dropout signal observable
+        // in-process. Coarse (one reset can bundle several lost buffers) but
+        // real, unlike the budget-relative TotalDropouts. Delta-sampled per UI
+        // tick; guarded against a host-side counter reset.
+        System.Reflection.PropertyInfo? _driverResetProp;
+        System.Reflection.PropertyInfo? _fillThreadActiveProp;
+        bool _underrunPropsResolved;
+        bool _underrunResolveFailed;
+        long _lastResetCount = -1;
+        long _sessionResets;          // total driver resets since counters last reset
+        bool _trueDropoutAvailable;   // build exposes the counter
+
+        void SampleTrueDropouts()
+        {
+            if (_underrunResolveFailed) return;
+            var buzz = _subscribedBuzz;
+            if (buzz == null) return;
+            try
+            {
+                if (!_underrunPropsResolved)
+                {
+                    var t = buzz.GetType();
+                    _driverResetProp      = t.GetProperty("DriverResetCount");
+                    _fillThreadActiveProp = t.GetProperty("FillThreadActive");
+                    _underrunPropsResolved = true;
+                    if (_driverResetProp == null)
+                    {
+                        _underrunResolveFailed = true;   // older host — fall back to budget metric
+                        return;
+                    }
+                }
+                long rc = (long)(_driverResetProp!.GetValue(buzz) ?? 0L);
+                _trueDropoutAvailable = true;
+
+                if (_lastResetCount < 0) _lastResetCount = rc;
+                if (rc < _lastResetCount) { _lastResetCount = rc; _sessionResets = 0; } // host reset
+                _sessionResets += rc - _lastResetCount;
+                _lastResetCount = rc;
+            }
+            catch { _underrunResolveFailed = true; }
+        }
 
         EngineSettingsInfo? ReadEngineSettings()
         {
