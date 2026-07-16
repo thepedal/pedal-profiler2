@@ -1515,6 +1515,10 @@ namespace WDE.PedalProfiler2
                             try { _machine.LastDeadlineOverrunUs = Convert.ToInt64(_deadlineOverrunProp.GetValue(buzz)); } catch { }
                         _machine.MarkGlitchAuto();
                     }
+                    else if (miss < _lastDeadlineMiss)
+                    {
+                        _lastDeadlineMiss = miss;   // host counters were reset — reseed, do not fire
+                    }
                 }
             }
             catch { }

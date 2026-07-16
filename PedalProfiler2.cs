@@ -88,7 +88,7 @@ namespace WDE.PedalProfiler2
         // ─── Version (single source of truth) ────────────────────────────────
         // Referenced from the reflection dump header and the About window.
         // Keeps the dump, About dialog, and git tag from drifting apart.
-        internal const string Version = "2.0.0";
+        internal const string Version = "2.1.0";
 
 
         // ─── ReBuzz context menu — About entry ───────────────────────────────
