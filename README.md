@@ -71,6 +71,7 @@ On next ReBuzz startup, the machine appears in the Generators browser tab as **P
 | Name | Range | Default | Purpose |
 |---|---|---|---|
 | Window | 16–128 | 64 | Buffers per averaging window. Smaller = more responsive, noisier. Larger = smoother, slower. |
+| FR Mark | 0–1 | 0 | Rising edge marks a glitch for the Flight Recorder (below). MIDI-learn to a momentary footswitch for hands-free marking. |
 
 ## Caveats
 
@@ -79,6 +80,74 @@ On next ReBuzz startup, the machine appears in the Generators browser tab as **P
 - **The active-machines list is up to 100 ms stale** at spike capture time. For typical spikes (5–50 ms inside a busy DSP graph) this is fine; for sub-100 ms toggle automation it's not.
 - **Selection state is session-only.** No persistence across song save/load.
 - **Don't toggle mutes manually while Profile All is running** — your toggle and its toggle will fight each other.
+
+## Flight Recorder
+
+An always-on "black box" that continuously records a lock-free tape of per-chunk
+timing, incoming MIDI CC, and the per-machine activity set, then freezes a window
+around a **mark** and reports which machines were active just before it — so you
+can ask "what was happening when that glitch happened?".
+
+Two triggers:
+- **Auto (primary):** the recorder polls ReBuzz's `DeadlineMissCount` and marks
+  the instant a *real* ASIO deadline miss occurs — latency-free, at the exact
+  moment of an audible dropout. No reacting, no plant. `DeadlineWorstOverrunMicros`
+  is captured as severity in the CSV header.
+- **Manual (fallback):** the **FR Mark** parameter (MIDI-learn to a footswitch)
+  or the "Flight Recorder — Mark now" context-menu item. Manual marks carry your
+  reaction latency, so their causal band is wide; the auto trigger is preferred.
+
+Activity is ReBuzz's own `IMachine.IsActive` (a machine actually producing
+output), read at ~50 Hz. Onset therefore fires when a machine *starts sounding*,
+which is what you want for real glitch attribution. `Work()` feeds the per-chunk
+tape and `MidiControlChange` feeds CC, both on the audio thread; the GUI's 50 Hz
+timer feeds cost samples and pumps the freeze.
+
+Artifacts are written to `%TEMP%\pp2_fr\`:
+- `pp2_fr_<hhmmss>.csv` — merged timeline for one mark (`t=0` at the mark,
+  negatives before), self-describing header + a `# bit N = name` legend.
+- `pp2_fr_assoc.txt` — cumulative association table across all marks this
+  session, sorted by onset-z then lift.
+
+**Reading the table.** `onset` + `z` is the signal: `z` is how far a machine's
+inactive→active rate near your marks exceeds what its own baseline predicts, so a
+busy machine isn't blamed just for being busy. `lift ≈ 1` means "along for the
+ride" — uninformative. Small mark counts mislead; collect many.
+
+### Using it
+
+Capture is **off by default** — opening the window records nothing. Turn it on in
+the **Flight Recorder** section of the inspector:
+
+1. Tick **Enable capture** (and optionally set the output **Folder** — defaults to
+   `%TEMP%\pp2_fr`; "Open folder" opens it). The enable flag and folder persist in
+   the song's `MachineState`. While unchecked, no timers sample, no marks fire, and
+   nothing is written — the window is safe to leave open.
+2. Keep the window open (cost sampling and the auto-trigger ride its 50 Hz timer;
+   closing the window stops both).
+3. Play a song hard enough to drop out (small ASIO buffer, heavy graph). Each real
+   deadline miss auto-marks and writes a `pp2_fr_<hhmmss>.csv` plus updates the
+   cumulative `pp2_fr_assoc.txt`.
+4. Read `pp2_fr_assoc.txt`: the machine whose `IsActive` is disproportionately high
+   in the ~400 ms before the misses tops the `t`/`lift` column; steadily-on machines
+   sit at `lift ≈ 1` (`t = na`) and are ignored. Clear the folder between sessions so
+   marks from different runs don't mix.
+
+**Reading the table.** `onset` + `z` is the signal — `z` is how far a machine's
+inactive→active rate near the marks exceeds what its own baseline predicts, so a
+busy machine isn't blamed just for being busy. `lift ≈ 1` = "along for the ride".
+Small mark counts mislead; let it collect a good number of misses.
+
+### Tuning notes
+
+- The auto-trigger's causal band is `AutoTightSec` (default 0.40 s pre-miss) in
+  `FlightRecorder.cs`; manual marks use `ReactLoSec`/`ReactHiSec`. At 50 Hz a
+  0.40 s band holds ~20 cost samples.
+- If `IMachine.IsActive` turns out not to gate cleanly on your machines (e.g. a
+  continuously-oscillating synth that never reads inactive), that's the signal
+  to fall back to engine-cost gating or a host-side activity feed.
+- CSV run-context is partial machine-side (BPM/budget/build/deadline severity);
+  ASIO/ratio/athreads/fillthread/ci come from the GUI dump and can be threaded in.
 
 ## License
 

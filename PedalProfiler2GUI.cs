@@ -84,6 +84,19 @@ namespace WDE.PedalProfiler2
         // ─── Dispatcher timer (100ms UI refresh) ─────────────────────────────
         readonly DispatcherTimer _timer;
 
+        // ─── Flight Recorder fast timer (~50Hz cost sampling + auto-trigger) ─
+        DispatcherTimer? _frCostTimer;
+        System.Reflection.PropertyInfo? _isActiveProp;      bool _isActiveResolved;
+        System.Reflection.PropertyInfo? _deadlineMissProp;
+        System.Reflection.PropertyInfo? _deadlineOverrunProp; bool _deadlineResolved;
+        long _lastDeadlineMiss = -1;   // -1 = not yet seeded
+
+        // Flight Recorder opt-in UI
+        CheckBox?   _frEnableCheckbox;
+        TextBox?    _frPathBox;
+        TextBlock?  _frStatusText;
+        bool        _frUiSynced;       // one-shot: pull persisted state into the controls once
+
 
         // ─── Selected machine (by name; resolved on each tick) ──────────────
         string?   _selectedName;
@@ -606,9 +619,19 @@ namespace WDE.PedalProfiler2
             _timer.Tick += OnTick;
             _timer.Start();
 
+            // Flight Recorder: fast cost sampling + deadline-miss auto-trigger,
+            // decoupled from the heavy 100ms UI refresh.
+            _frCostTimer = new DispatcherTimer(DispatcherPriority.Render)
+            {
+                Interval = TimeSpan.FromMilliseconds(20)   // ~50Hz nominal
+            };
+            _frCostTimer.Tick += OnFrCostTick;
+            _frCostTimer.Start();
+
             Unloaded += (_, __) =>
             {
                 _timer.Stop();
+                _frCostTimer?.Stop();
                 _measureTimer?.Stop();
                 _muteDeltaTimer?.Stop();
                 UnhookMasterTap();
@@ -1111,6 +1134,58 @@ namespace WDE.PedalProfiler2
             diagRow.Children.Add(_dumpStatusText);
             root.Children.Add(diagRow);
 
+            // ── Flight Recorder (opt-in glitch capture) ──────────────────────
+            root.Children.Add(SectionHeader("Flight Recorder"));
+            var frRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 4) };
+            _frEnableCheckbox = new CheckBox
+            {
+                Content    = "Enable capture",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                IsChecked  = false
+            };
+            _frEnableCheckbox.Checked   += (_, __) => { if (_machine != null) _machine.FrEnabled = true;  _lastDeadlineMiss = -1; UpdateFrStatus(); };
+            _frEnableCheckbox.Unchecked += (_, __) => { if (_machine != null) _machine.FrEnabled = false; UpdateFrStatus(); };
+            frRow.Children.Add(_frEnableCheckbox);
+
+            var frOpenBtn = new Button
+            {
+                Content = "Open folder",
+                FontFamily = Mono, FontSize = 10,
+                Margin  = new Thickness(12, 0, 0, 0),
+                Padding = new Thickness(6, 1, 6, 1)
+            };
+            frOpenBtn.Click += (_, __) => OpenFrFolder();
+            frRow.Children.Add(frOpenBtn);
+            root.Children.Add(frRow);
+
+            var frPathRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 4) };
+            frPathRow.Children.Add(new TextBlock
+            {
+                Text = "Folder:", Foreground = BrushSubText, FontFamily = Mono, FontSize = 10,
+                VerticalAlignment = VerticalAlignment.Center
+            });
+            _frPathBox = new TextBox
+            {
+                Text       = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "pp2_fr"),
+                FontFamily = Mono, FontSize = 10, MinWidth = 300,
+                Margin     = new Thickness(6, 0, 0, 0),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            _frPathBox.TextChanged += (_, __) => { if (_machine != null) _machine.FrOutputDir = _frPathBox.Text; UpdateFrStatus(); };
+            frPathRow.Children.Add(_frPathBox);
+            root.Children.Add(frPathRow);
+
+            _frStatusText = new TextBlock
+            {
+                Text = "Off — window can stay open with no files written (default).",
+                Foreground = BrushSubText, FontFamily = Mono, FontSize = 10,
+                TextWrapping = TextWrapping.Wrap
+            };
+            root.Children.Add(_frStatusText);
+
             // ── Global status footer ─────────────────────────────────────────
             var footerStack = new StackPanel();
             footerStack.Children.Add(_globalStatusText = new TextBlock
@@ -1284,6 +1359,17 @@ namespace WDE.PedalProfiler2
         void OnTick(object? sender, EventArgs e)
         {
             if (_machine == null) return;
+
+            // One-shot: pull persisted FR state (from MachineState) into the controls.
+            if (!_frUiSynced && _frEnableCheckbox != null)
+            {
+                _frEnableCheckbox.IsChecked = _machine.FrEnabled;
+                if (_frPathBox != null && !string.IsNullOrEmpty(_machine.FrOutputDir))
+                    _frPathBox.Text = _machine.FrOutputDir;
+                _frUiSynced = true;
+                UpdateFrStatus();
+            }
+
             var snap = _machine.Snapshot;
             if (snap == null) return;
 
@@ -1362,8 +1448,109 @@ namespace WDE.PedalProfiler2
 
 
         // ═════════════════════════════════════════════════════════════════════
-        // Mute-delta detection (passive — fires when user toggles mute)
+        // Flight Recorder fast tick (~50Hz): cost sampling on the IsActive set,
+        // plus latency-free auto-trigger on real ASIO deadline misses.
         // ═════════════════════════════════════════════════════════════════════
+        bool ReadIsActive(IMachine m)
+        {
+            try
+            {
+                if (!_isActiveResolved)
+                {
+                    _isActiveProp = m.GetType().GetProperty("IsActive");
+                    _isActiveResolved = true;
+                }
+                if (_isActiveProp == null) return false;
+                return _isActiveProp.GetValue(m) is bool b && b;
+            }
+            catch { return false; }
+        }
+
+        void OnFrCostTick(object? sender, EventArgs e)
+        {
+            if (_machine == null || !_machine.FrEnabled || _subscribedBuzz?.Song == null) return;
+
+            // Only sample while playing — keeps the baseline denominator honest
+            // (stopped time would otherwise dilute every machine's base rate).
+            bool playing = false;
+            try { playing = _subscribedBuzz.Playing; } catch { }
+            if (!playing) return;
+
+            // Active-set = ReBuzz's own per-machine activity flag (producing
+            // output), NOT mute state. Read via reflection in case IsActive isn't
+            // on the public IMachine interface.
+            try
+            {
+                var active = _subscribedBuzz.Song.Machines
+                    .Where(m => { try { return !m.IsControlMachine && ReadIsActive(m); } catch { return false; } })
+                    .Select(m => m.Name)
+                    .ToArray();
+                _machine.FlightRecorderCostSample(active);
+            }
+            catch { }
+
+            // Deadline-miss auto-trigger: fire a mark the instant ReBuzz's real
+            // ASIO deadline-miss counter increments (unlike the cadence-inflated
+            // internal-budget dropout tally — this is the ground-truth trigger).
+            try
+            {
+                var buzz = _subscribedBuzz;
+                if (!_deadlineResolved)
+                {
+                    _deadlineMissProp    = buzz.GetType().GetProperty("DeadlineMissCount");
+                    _deadlineOverrunProp = buzz.GetType().GetProperty("DeadlineWorstOverrunMicros");
+                    _deadlineResolved = true;
+                }
+                if (_deadlineMissProp != null)
+                {
+                    long miss = Convert.ToInt64(_deadlineMissProp.GetValue(buzz));
+                    if (_lastDeadlineMiss < 0)
+                    {
+                        _lastDeadlineMiss = miss;          // seed — don't fire on the first read
+                    }
+                    else if (miss > _lastDeadlineMiss)
+                    {
+                        _lastDeadlineMiss = miss;
+                        if (_deadlineOverrunProp != null)
+                            try { _machine.LastDeadlineOverrunUs = Convert.ToInt64(_deadlineOverrunProp.GetValue(buzz)); } catch { }
+                        _machine.MarkGlitchAuto();
+                    }
+                }
+            }
+            catch { }
+        }
+
+        void UpdateFrStatus()
+        {
+            if (_frStatusText == null) return;
+            bool on = _frEnableCheckbox?.IsChecked == true;
+            string dir = _machine?.FrOutputDir ?? _frPathBox?.Text ?? "";
+            if (on)
+            {
+                _frStatusText.Text = "Recording ON — auto-marks on ASIO deadline misses → " + dir;
+                _frStatusText.Foreground = BrushOk;
+            }
+            else
+            {
+                _frStatusText.Text = "Off — window can stay open with no files written (default).";
+                _frStatusText.Foreground = BrushSubText;
+            }
+        }
+
+        void OpenFrFolder()
+        {
+            try
+            {
+                string dir = _machine?.FrOutputDir ?? _frPathBox?.Text ?? "";
+                if (string.IsNullOrWhiteSpace(dir)) return;
+                System.IO.Directory.CreateDirectory(dir);
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = dir, UseShellExecute = true
+                });
+            }
+            catch { }
+        }
         void DetectMuteDelta(Profile2Snapshot snap)
         {
             if (_selectedIMachine == null) return;
