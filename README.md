@@ -138,6 +138,26 @@ inactive→active rate near the marks exceeds what its own baseline predicts, so
 busy machine isn't blamed just for being busy. `lift ≈ 1` = "along for the ride".
 Small mark counts mislead; let it collect a good number of misses.
 
+### Host-overhead analysis (`host.txt`)
+
+Alongside `assoc.txt`, each freeze writes a cumulative `pp2_fr_host.txt` that asks
+whether the misses have a **temporal signature**, using only the per-chunk tape
+plus a BCL `GC.CollectionCount(2)` poll — no host cooperation. Over a 5 s pre-miss
+window it reports:
+
+- **ramp** — median `OtherMs` of the 2nd half minus the 1st half. Rising ⇒ the
+  host cost drains toward the deadline (sustained overhead); flat ⇒ no drift.
+- **shape** — how many miss windows are spike-dominated (peak > 5× median),
+  i.e. one pathological chunk vs a gradual climb.
+- **GC Gen2** — fraction of misses within 50 / 200 ms of a Gen2 collection.
+- **worst overrun** and **peak chunk gap** for severity.
+
+The verdict routes to a cause class: GC-clustered ⇒ allocation-rate (target
+DSP-path allocations); ramping ⇒ per-chunk overhead; isolated GC-independent
+spikes ⇒ acute stalls (lock/IPC/DPC); flat & GC-independent ⇒ no signature, do
+the static perf fixes rather than instrument further. This is a **gate**: only a
+signature justifies a ReBuzz-side instrumentation feed.
+
 ### Tuning notes
 
 - The auto-trigger's causal band is `AutoTightSec` (default 0.40 s pre-miss) in

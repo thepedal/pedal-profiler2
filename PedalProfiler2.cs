@@ -327,6 +327,9 @@ namespace WDE.PedalProfiler2
             catch { /* never let recorder I/O disturb the host */ }
         }
 
+        // Stage-2: let the GUI's stall drain write to the same configured folder.
+        public void WriteFrFile(string name, string content) => DeliverFrArtifact(name, content);
+
         // Run context for the CSV header. Only the fields available machine-side
         // are filled here (Bpm, BudgetMs, Build); ASIO/ratio/athreads/fillthread/ci
         // need PP2's GUI reflection and are left unknown for the validation build.

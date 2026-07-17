@@ -96,6 +96,7 @@ namespace WDE.PedalProfiler2
         TextBox?    _frPathBox;
         TextBlock?  _frStatusText;
         bool        _frUiSynced;       // one-shot: pull persisted state into the controls once
+        readonly StallDrain _stallDrain = new StallDrain();   // Stage-2 engine stall snapshots
 
 
         // ─── Selected machine (by name; resolved on each tick) ──────────────
@@ -1370,6 +1371,9 @@ namespace WDE.PedalProfiler2
                 UpdateFrStatus();
             }
 
+            // Stage-2: keep the engine's stall capture armed == FR enabled.
+            try { if (_subscribedBuzz != null) _stallDrain.SetArmed(_subscribedBuzz, _machine.FrEnabled); } catch { }
+
             var snap = _machine.Snapshot;
             if (snap == null) return;
 
@@ -1522,6 +1526,9 @@ namespace WDE.PedalProfiler2
                 }
             }
             catch { }
+
+            // Stage-2: drain engine stall snapshots into pp2_fr_stall.txt.
+            try { _stallDrain.Poll(_subscribedBuzz, _machine.WriteFrFile); } catch { }
         }
 
         void UpdateFrStatus()
