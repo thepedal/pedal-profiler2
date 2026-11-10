@@ -88,7 +88,7 @@ namespace WDE.PedalProfiler2
         // ─── Version (single source of truth) ────────────────────────────────
         // Referenced from the reflection dump header and the About window.
         // Keeps the dump, About dialog, and git tag from drifting apart.
-        internal const string Version = "2.1.0";
+        internal const string Version = "2.2.2";
 
 
         // ─── ReBuzz context menu — About entry ───────────────────────────────
@@ -326,9 +326,6 @@ namespace WDE.PedalProfiler2
             }
             catch { /* never let recorder I/O disturb the host */ }
         }
-
-        // Stage-2: let the GUI's stall drain write to the same configured folder.
-        public void WriteFrFile(string name, string content) => DeliverFrArtifact(name, content);
 
         // Run context for the CSV header. Only the fields available machine-side
         // are filled here (Bpm, BudgetMs, Build); ASIO/ratio/athreads/fillthread/ci

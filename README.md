@@ -24,7 +24,8 @@ A separate, resizable inspector window with:
   - **Profile All (Solo)** — invasive sweep using solo measurement. ~2 s per machine. Use when engine data is unavailable or when you want the "with-overhead" picture.
   Both produce a sorted bar chart scaled against the buffer budget; rows are clickable to focus.
 - **Diagnostics — "Dump Internals (DC)" button** — walks `IBuzz`, the selected machine's `MachineCore`, and a parameter's `ParameterCore` via reflection and dumps every reachable public + non-public property and field to the ReBuzz Debug Console (which it also opens automatically). Useful for mapping what engine internals are accessible without touching live state — read-only, no modifications. Helps decide what's worth exposing in future iterations.
-- **Global status footer** — overall CPU %, dropouts, spikes, so you don't lose situational awareness while focused on one machine.
+- **Global status footer** — overall CPU %, real **deadline misses** (count, rate, worst overrun — see below), spikes, so you don't lose situational awareness while focused on one machine.
+- **Reset miss counters** — zeroes ReBuzz's deadline-miss counters and restarts PP2's miss window, for clean A/B legs (e.g. multithreading on vs off).
 
 ## Solo vs Marginal — which number do you want?
 
@@ -81,6 +82,53 @@ On next ReBuzz startup, the machine appears in the Generators browser tab as **P
 - **Selection state is session-only.** No persistence across song save/load.
 - **Don't toggle mutes manually while Profile All is running** — your toggle and its toggle will fight each other.
 
+## Deadline misses (v2.2.0)
+
+ReBuzz builds that expose `DeadlineMissCount` (1835+ dev builds) count every audio
+driver callback whose wall time exceeded its **own** block period (frames / sample
+rate). Unlike the budget-relative dropout family (`TotalDropouts%`, `WindowDropouts`,
+overruns/s), this is referenced to the real playback deadline, so it is not inflated by
+a large driver:chunk ratio. It was validated against listening (no false negatives) and
+is now PP2's primary dropout signal:
+
+- **Footer:** `N deadline misses (0.11/s, worst 136 ms)` — red if a miss happened in the
+  last 10 s. `DriverResetCount` (a device catastrophic-reset tally, blind to ordinary
+  underruns) is shown only when non-zero and labelled as device resets.
+- **Dump:** a `DEADLINE MISSES` section straight after `RUN CONTEXT` — host count,
+  misses over PP2's window with rate, last-60-s count, worst overrun (scope stated), and
+  a **miss log**. One stall makes several consecutive callbacks overrun, so misses less
+  than 0.5 s apart are grouped into **episodes** (v2.2.1). Per miss: time, episode, song
+  position, ticks since the latest pattern start in any non-Master sequence, time since
+  the last gen-1 / gen-2 GC, and GC pause time in the 250 ms before detection. Three
+  tests run on episode onsets against a random-time control sampled at 2 Hz while
+  playing (binomial p-values):
+  - *pattern-boundary* — onset within ~150 ms of a pattern start;
+  - *G2-before* — a gen-2 collection within 500 ms before the onset;
+  - *GC-pause* — GC pause in the 250 ms before the onset above the control's 90th
+    percentile (v2.2.2; a fixed threshold was useless when GC pause is always high).
+- **GC section** (v2.2.2): over the miss window — G2 count and spacing, GC pause as % of
+  wall time, allocation MB/s — plus GC mode (server/concurrent/latency mode, process
+  pause-time %) and the last ephemeral / background / full-blocking GC with pause
+  durations, promoted and fragmented MB.
+- **Machine-readable line** is `PP2 v5` (v2.2.2): trailing group
+  `dmiss= dwin= drate= dworst_us= dhost= dreset= mtnoisy= dep= depr= g2win= gcpause= alloc=`
+  after `qpc=` (gcpause in % of wall time, alloc in MB/s);
+  all v2 fields are unchanged and in place.
+- **Flight Recorder** auto-marks now share the same sampler (no behaviour change).
+
+The worst overrun is a single high-water mark since ReBuzz started or since the last
+reset — press **Reset miss counters** before a measurement leg to scope it.
+
+## Per-machine cost under multithreading (v2.2.0)
+
+With MT on, ReBuzz's per-machine stopwatch brackets the whole work call, so any thread
+pause (preemption, a GC) is charged to whichever machine was mid-Work; a single dump's
+per-machine ranking is therefore noisy on big songs. The dump now says so under the
+table when MT is on and flags `⚑MT` on any machine whose ms/buf is >5× the median of
+its same-DLL siblings (and >0.05 ms above it); siblings under 0.005 ms are treated as
+idle and left out of the median. Average several dumps, use Measure
+Marginal, or dump once with MT off for a clean ranking.
+
 ## Flight Recorder
 
 An always-on "black box" that continuously records a lock-free tape of per-chunk
@@ -89,7 +137,7 @@ around a **mark** and reports which machines were active just before it — so y
 can ask "what was happening when that glitch happened?".
 
 Two triggers:
-- **Auto (primary):** the recorder polls ReBuzz's `DeadlineMissCount` and marks
+- **Auto (primary):** the recorder uses PP2's shared deadline-miss sampler (~50 Hz) and marks
   the instant a *real* ASIO deadline miss occurs — latency-free, at the exact
   moment of an audible dropout. No reacting, no plant. `DeadlineWorstOverrunMicros`
   is captured as severity in the CSV header.
@@ -137,26 +185,6 @@ the **Flight Recorder** section of the inspector:
 inactive→active rate near the marks exceeds what its own baseline predicts, so a
 busy machine isn't blamed just for being busy. `lift ≈ 1` = "along for the ride".
 Small mark counts mislead; let it collect a good number of misses.
-
-### Host-overhead analysis (`host.txt`)
-
-Alongside `assoc.txt`, each freeze writes a cumulative `pp2_fr_host.txt` that asks
-whether the misses have a **temporal signature**, using only the per-chunk tape
-plus a BCL `GC.CollectionCount(2)` poll — no host cooperation. Over a 5 s pre-miss
-window it reports:
-
-- **ramp** — median `OtherMs` of the 2nd half minus the 1st half. Rising ⇒ the
-  host cost drains toward the deadline (sustained overhead); flat ⇒ no drift.
-- **shape** — how many miss windows are spike-dominated (peak > 5× median),
-  i.e. one pathological chunk vs a gradual climb.
-- **GC Gen2** — fraction of misses within 50 / 200 ms of a Gen2 collection.
-- **worst overrun** and **peak chunk gap** for severity.
-
-The verdict routes to a cause class: GC-clustered ⇒ allocation-rate (target
-DSP-path allocations); ramping ⇒ per-chunk overhead; isolated GC-independent
-spikes ⇒ acute stalls (lock/IPC/DPC); flat & GC-independent ⇒ no signature, do
-the static perf fixes rather than instrument further. This is a **gate**: only a
-signature justifies a ReBuzz-side instrumentation feed.
 
 ### Tuning notes
 

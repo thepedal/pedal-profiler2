@@ -87,16 +87,17 @@ namespace WDE.PedalProfiler2
         // ─── Flight Recorder fast timer (~50Hz cost sampling + auto-trigger) ─
         DispatcherTimer? _frCostTimer;
         System.Reflection.PropertyInfo? _isActiveProp;      bool _isActiveResolved;
-        System.Reflection.PropertyInfo? _deadlineMissProp;
-        System.Reflection.PropertyInfo? _deadlineOverrunProp; bool _deadlineResolved;
-        long _lastDeadlineMiss = -1;   // -1 = not yet seeded
+
+        // ─── Deadline-miss monitor (v2.2) — shared by footer, dump, FR auto-mark ─
+        readonly DeadlineMonitor _deadline = new();
+        int _phaseSampleTick;          // ~2 Hz pattern-phase control sampling
+        TextBlock? _missResetStatus;
 
         // Flight Recorder opt-in UI
         CheckBox?   _frEnableCheckbox;
         TextBox?    _frPathBox;
         TextBlock?  _frStatusText;
         bool        _frUiSynced;       // one-shot: pull persisted state into the controls once
-        readonly StallDrain _stallDrain = new StallDrain();   // Stage-2 engine stall snapshots
 
 
         // ─── Selected machine (by name; resolved on each tick) ──────────────
@@ -1135,6 +1136,37 @@ namespace WDE.PedalProfiler2
             diagRow.Children.Add(_dumpStatusText);
             root.Children.Add(diagRow);
 
+            // Deadline-miss counter reset (v2.2). Calls ReBuzz's
+            // ResetAudioDropoutCounters() when the build has it (zeroes misses,
+            // worst overrun and device resets), else rebaselines PP2 locally.
+            // Use between A/B legs (e.g. MT on/off) so the dump's window and
+            // worst-overrun cover only the leg being measured.
+            var missRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+            var missResetBtn = MakeButton("Reset miss counters", 200);
+            missResetBtn.ToolTip = "Zero ReBuzz's DeadlineMissCount / worst overrun / device resets and restart PP2's miss window + log";
+            missResetBtn.Click += (_, __) =>
+            {
+                _deadline.Reset(_subscribedBuzz);
+                if (_missResetStatus != null)
+                {
+                    _missResetStatus.Text = _deadline.LastResetResult ?? "";
+                    _missResetStatus.Foreground = _deadline.Available ? BrushOk : BrushWarn;
+                }
+            };
+            missRow.Children.Add(missResetBtn);
+            _missResetStatus = new TextBlock
+            {
+                Text       = "deadline-miss window starts when PP2 first reads the counter",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextWrapping = TextWrapping.Wrap,
+                Margin     = new Thickness(8, 0, 0, 0)
+            };
+            missRow.Children.Add(_missResetStatus);
+            root.Children.Add(missRow);
+
             // ── Flight Recorder (opt-in glitch capture) ──────────────────────
             root.Children.Add(SectionHeader("Flight Recorder"));
             var frRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 4) };
@@ -1147,7 +1179,7 @@ namespace WDE.PedalProfiler2
                 VerticalAlignment = VerticalAlignment.Center,
                 IsChecked  = false
             };
-            _frEnableCheckbox.Checked   += (_, __) => { if (_machine != null) _machine.FrEnabled = true;  _lastDeadlineMiss = -1; UpdateFrStatus(); };
+            _frEnableCheckbox.Checked   += (_, __) => { if (_machine != null) _machine.FrEnabled = true;  UpdateFrStatus(); };
             _frEnableCheckbox.Unchecked += (_, __) => { if (_machine != null) _machine.FrEnabled = false; UpdateFrStatus(); };
             frRow.Children.Add(_frEnableCheckbox);
 
@@ -1371,14 +1403,27 @@ namespace WDE.PedalProfiler2
                 UpdateFrStatus();
             }
 
-            // Stage-2: keep the engine's stall capture armed == FR enabled.
-            try { if (_subscribedBuzz != null) _stallDrain.SetArmed(_subscribedBuzz, _machine.FrEnabled); } catch { }
-
             var snap = _machine.Snapshot;
             if (snap == null) return;
 
             // ── Publish active machines list for spike attribution ───────────
             PublishActiveMachinesIfDue();
+
+            // ── Control sample (~2 Hz while playing, v2.2.1) ──────────────
+            // Random-time baseline for the miss log's pattern-phase and GC tests.
+            if (++_phaseSampleTick >= 5)
+            {
+                _phaseSampleTick = 0;
+                try
+                {
+                    if (_subscribedBuzz?.Playing == true)
+                    {
+                        var pc = BuildMissContext();
+                        _deadline.AddControlSample(pc);
+                    }
+                }
+                catch { }
+            }
 
             // ── Resolve selection if a name is set but reference went stale ─
             if (_selectedName != null && _selectedIMachine == null)
@@ -1472,6 +1517,14 @@ namespace WDE.PedalProfiler2
 
         void OnFrCostTick(object? sender, EventArgs e)
         {
+            // ── Deadline-miss sampler (v2.2) ─────────────────────────────────
+            // Runs every tick regardless of Flight Recorder state: it feeds the
+            // footer, the dump's DEADLINE MISSES section and the miss log. One
+            // delegate call + three GC.CollectionCount reads when nothing changed;
+            // the song context is only built when a miss is detected.
+            int newMisses = 0;
+            try { newMisses = _deadline.Sample(_subscribedBuzz, BuildMissContext); } catch { }
+
             if (_machine == null || !_machine.FrEnabled || _subscribedBuzz?.Song == null) return;
 
             // Only sample while playing — keeps the baseline denominator honest
@@ -1494,41 +1547,76 @@ namespace WDE.PedalProfiler2
             catch { }
 
             // Deadline-miss auto-trigger: fire a mark the instant ReBuzz's real
-            // ASIO deadline-miss counter increments (unlike the cadence-inflated
+            // callback-deadline counter increments (unlike the cadence-inflated
             // internal-budget dropout tally — this is the ground-truth trigger).
+            // Detection is shared with the dump/footer via _deadline (v2.2).
+            if (newMisses > 0)
+            {
+                try
+                {
+                    _machine.LastDeadlineOverrunUs = _deadline.WorstUs;
+                    _machine.MarkGlitchAuto();
+                }
+                catch { }
+            }
+        }
+
+        // Song/transport context for a miss-log entry (and the ~2 Hz phase
+        // control sample). PatPos = ticks since the most recent pattern start
+        // in any non-Master sequence (min PlayingPatternPosition) — the pattern-boundary
+        // hypothesis (MT findings 2026-11-10 §3) predicts misses cluster near 0.
+        static bool IsMasterMachine(IMachine? m)
+        {
+            if (m == null) return false;
+            try { if (m.DLL?.Name == "Master") return true; } catch { }
+            try { return m.Name == "Master" && m.ManagedMachine == null; } catch { return false; }
+        }
+
+        MissSongContext BuildMissContext()
+        {
+            var c = new MissSongContext { PatPos = -1 };
+            var buzz = _subscribedBuzz;
+            var song = buzz?.Song;
+            if (buzz == null || song == null) return c;
+            try { c.Playing = buzz.Playing; } catch { }
+            try { c.Bpm = buzz.BPM; c.Tpb = buzz.TPB; } catch { }
+            try { c.SongPos = song.PlayPosition; c.LoopStart = song.LoopStart; c.LoopEnd = song.LoopEnd; } catch { }
+
+            // Tolerance ≈ ticks in 150 ms (≤20 ms poll lag + up to one ~66 ms
+            // driver block + UI scheduling), at least 1 tick.
+            double ticksPerSec = (c.Bpm > 0 && c.Tpb > 0) ? c.Bpm * c.Tpb / 60.0 : 0;
+            c.NearStartTicks = Math.Max(1, (int)Math.Ceiling(ticksPerSec * 0.150));
+
             try
             {
-                var buzz = _subscribedBuzz;
-                if (!_deadlineResolved)
+                foreach (var seq in song.Sequences)
                 {
-                    _deadlineMissProp    = buzz.GetType().GetProperty("DeadlineMissCount");
-                    _deadlineOverrunProp = buzz.GetType().GetProperty("DeadlineWorstOverrunMicros");
-                    _deadlineResolved = true;
-                }
-                if (_deadlineMissProp != null)
-                {
-                    long miss = Convert.ToInt64(_deadlineMissProp.GetValue(buzz));
-                    if (_lastDeadlineMiss < 0)
+                    try
                     {
-                        _lastDeadlineMiss = miss;          // seed — don't fire on the first read
+                        if (seq == null || seq.IsDisabled) continue;
+                        // v2.2.1: skip the Master sequence — its short tempo /
+                        // automation patterns made every moment look "near a
+                        // pattern start" (050 dump: 16-tick patterns, control 25%).
+                        if (IsMasterMachine(seq.Machine)) continue;
+                        var pat = seq.PlayingPattern;
+                        if (pat == null) continue;
+                        int pos = seq.PlayingPatternPosition;
+                        if (pos < 0) continue;
+                        c.SeqsPlaying++;
+                        if (pos <= c.NearStartTicks) c.SeqsNearStart++;
+                        if (c.PatPos < 0 || pos < c.PatPos)
+                        {
+                            c.PatPos = pos;
+                            try { c.PatLen = pat.Length; } catch { c.PatLen = 0; }
+                            try { c.PatMachine = seq.Machine?.Name ?? ""; } catch { c.PatMachine = ""; }
+                        }
                     }
-                    else if (miss > _lastDeadlineMiss)
-                    {
-                        _lastDeadlineMiss = miss;
-                        if (_deadlineOverrunProp != null)
-                            try { _machine.LastDeadlineOverrunUs = Convert.ToInt64(_deadlineOverrunProp.GetValue(buzz)); } catch { }
-                        _machine.MarkGlitchAuto();
-                    }
-                    else if (miss < _lastDeadlineMiss)
-                    {
-                        _lastDeadlineMiss = miss;   // host counters were reset — reseed, do not fire
-                    }
+                    catch { }
                 }
             }
             catch { }
-
-            // Stage-2: drain engine stall snapshots into pp2_fr_stall.txt.
-            try { _stallDrain.Poll(_subscribedBuzz, _machine.WriteFrFile); } catch { }
+            c.Valid = true;
+            return c;
         }
 
         void UpdateFrStatus()
@@ -2781,7 +2869,6 @@ namespace WDE.PedalProfiler2
         // ═════════════════════════════════════════════════════════════════════
         void RefreshGlobalStatus(Profile2Snapshot snap)
         {
-            SampleTrueDropouts();
 
             if (!snap.IsValid)
             {
@@ -2791,21 +2878,37 @@ namespace WDE.PedalProfiler2
             {
                 int spikeCount = snap.Spikes?.Length ?? 0;
 
-                // TRUE deadline-referenced dropouts (Option 2 v2): device
-                // callbacks whose wall-time overran the buffer deadline — actual
-                // missed deadlines, valid whether or not the fill thread is on.
-                // The budget-relative snap.TotalDropouts is the legacy fallback.
+                // Deadline-referenced dropouts (v2.2): ReBuzz's DeadlineMissCount —
+                // driver callbacks whose wall time exceeded their own block period.
+                // Validated against the ears (PedalBench 2026-07-16). The 2.1.0
+                // footer showed DriverResetCount here as "true dropout"; that
+                // counter is a device catastrophic-reset tally, blind to ordinary
+                // underruns, so it's now shown only when non-zero and labelled as
+                // such. Budget-relative snap.TotalDropouts is the pre-1835 fallback.
                 string dropSeg;
-                if (_trueDropoutAvailable)
-                    dropSeg = $"{_sessionResets} driver reset(s) (true dropout)";
+                if (_deadline.Available)
+                {
+                    long n = _deadline.WindowMisses;
+                    double r = _deadline.WindowRate;
+                    string rate  = _deadline.WindowSec > 5 ? $" ({r:F2}/s)" : "";
+                    string worst = _deadline.WorstUs > 0 ? $", worst {_deadline.WorstUs / 1000.0:F0} ms" : "";
+                    int ep = _deadline.Episodes;
+                    string eps = (ep > 0 && ep != n) ? $" in {ep} episode{(ep == 1 ? "" : "s")}" : "";
+                    dropSeg = $"{n} deadline miss{(n == 1 ? "" : "es")}{eps}{rate}{worst}";
+                }
                 else
                     dropSeg = $"{snap.TotalDropouts} dropouts (budget)";
+                if (_deadline.DriverResets > 0)
+                    dropSeg += $"  ·  {_deadline.DriverResets} device reset(s)";
 
                 _globalStatusText.Text =
                     $"Global: {snap.CpuPct:F1}% CPU  ·  {dropSeg}  ·  {spikeCount} spike(s) logged";
-                // Colour bad if any missed deadline this session, else fall back to CPU.
+                // Colour: a miss in the last 10 s → bad, any this window → warn,
+                // else fall back to CPU utilisation.
+                long recent = _deadline.Available ? _deadline.MissesInLast(10).count : 0;
                 _globalStatusText.Foreground =
-                      (_trueDropoutAvailable && _sessionResets > 0) ? BrushBad
+                      recent > 0 ? BrushBad
+                    : (_deadline.Available && _deadline.WindowMisses > 0) ? BrushWarn
                     : snap.CpuPct >= 90 ? BrushBad
                     : snap.CpuPct >= 70 ? BrushWarn
                     : BrushSubText;
@@ -2949,51 +3052,12 @@ namespace WDE.PedalProfiler2
         bool _esPropsResolved;
         bool _engineSettingsResolveFailed;
 
-        // ─── Deadline-referenced dropout counters (PP2 Option 2) ─────────────
-        // TRUE dropouts from ReBuzzCore (public prop DriverResetCount — 1835+;
-        // null on older builds). This is the device driver's own reset/xrun
-        // notification (ASIO DriverResetRequest / WASAPI PlaybackStopped-with-
-        // exception) — the only real, device-reported dropout signal observable
-        // in-process. Coarse (one reset can bundle several lost buffers) but
-        // real, unlike the budget-relative TotalDropouts. Delta-sampled per UI
-        // tick; guarded against a host-side counter reset.
-        System.Reflection.PropertyInfo? _driverResetProp;
-        System.Reflection.PropertyInfo? _fillThreadActiveProp;
-        bool _underrunPropsResolved;
-        bool _underrunResolveFailed;
-        long _lastResetCount = -1;
-        long _sessionResets;          // total driver resets since counters last reset
-        bool _trueDropoutAvailable;   // build exposes the counter
-
-        void SampleTrueDropouts()
-        {
-            if (_underrunResolveFailed) return;
-            var buzz = _subscribedBuzz;
-            if (buzz == null) return;
-            try
-            {
-                if (!_underrunPropsResolved)
-                {
-                    var t = buzz.GetType();
-                    _driverResetProp      = t.GetProperty("DriverResetCount");
-                    _fillThreadActiveProp = t.GetProperty("FillThreadActive");
-                    _underrunPropsResolved = true;
-                    if (_driverResetProp == null)
-                    {
-                        _underrunResolveFailed = true;   // older host — fall back to budget metric
-                        return;
-                    }
-                }
-                long rc = (long)(_driverResetProp!.GetValue(buzz) ?? 0L);
-                _trueDropoutAvailable = true;
-
-                if (_lastResetCount < 0) _lastResetCount = rc;
-                if (rc < _lastResetCount) { _lastResetCount = rc; _sessionResets = 0; } // host reset
-                _sessionResets += rc - _lastResetCount;
-                _lastResetCount = rc;
-            }
-            catch { _underrunResolveFailed = true; }
-        }
+        // ─── Deadline-referenced dropout counters ────────────────────────────
+        // v2.2: DeadlineMissCount / DeadlineWorstOverrunMicros / DriverResetCount
+        // are all read by DeadlineMonitor (_deadline), polled from the ~50 Hz
+        // timer. The 2.1.0 SampleTrueDropouts() reader for DriverResetCount is
+        // gone — that counter is a catastrophic device-reset tally, not a
+        // dropout counter (PedalBench 2026-07-16).
 
         EngineSettingsInfo? ReadEngineSettings()
         {
@@ -3604,6 +3668,12 @@ namespace WDE.PedalProfiler2
 
             // Per-machine cost (uses existing UpdateEngineCost EMA — no blocking)
             var perMachine = CollectPerMachineCosts(buzz, budgetMs);
+            bool mtOn = es?.Multithreading == true;
+            int mtNoisyCount = FlagNoisyUnderMt(perMachine, mtOn);
+
+            // Deadline-miss state (v2.2) — refresh once so the dump is current
+            try { _deadline.Sample(buzz, BuildMissContext); } catch { }
+            var deadlineEvents = _deadline.RecentEvents();
 
             // SubTickSize (IBuzz public field, 260 on 1827)
             int subTickSize = 0;
@@ -3658,12 +3728,19 @@ namespace WDE.PedalProfiler2
             Line("");
 
             // Machine-readable single line (versioned, parseable).
+            // Bumped v4 → v5 in PP2 v2.2.2: appended g2win= gcpause=<pct of wall time, no % sign> alloc=<MB/s, no unit>
+            // (all over the deadline-miss window) after depr=.
+            // Bumped v3 → v4 in PP2 v2.2.1: appended dep= (deadline-miss episodes)
+            // and depr= (episodes/s) after mtnoisy=.
+            // Bumped v2 → v3 in PP2 v2.2.0: appended a trailing deadline group
+            // (dmiss/dwin/drate/dworst_us/dhost/dreset) plus mtnoisy=; every v2
+            // field is unchanged and in the same position.
             // Bumped v1 → v2 in PP2 v1.9.3: added `ci=` (cadence-inflated flag
             // for the whole dropout family) and `athreads=` (AudioThreads from
             // registry). Diffing scripts targeting v1 should update the field
             // set OR pin to v1-format legacy dumps.
             string mline = BuildMachineLine(
-                version: "PP2 v2",
+                version: "PP2 v5",
                 t: elapsedS, chunkMs: budgetMs,
                 p50: pct.p50, p90: pct.p90, p99: pct.p99, max: pct.max,
                 dropPct: PercentDropouts(snap), wdrop: snap?.WindowDropouts ?? 0,
@@ -3675,7 +3752,8 @@ namespace WDE.PedalProfiler2
                 asioBufSmp: asioBufSmp, chunkSmp: chunkSmp,
                 ratio: driverChunkRatio,
                 cadenceInflated: cadenceInflated, audioThreads: audioThreads,
-                qpcHz: (long)Stopwatch.Frequency);
+                qpcHz: (long)Stopwatch.Frequency,
+                dl: _deadline, mtNoisy: mtOn ? mtNoisyCount : (int?)null);
             Line(mline);
             Line("");
 
@@ -3710,6 +3788,12 @@ namespace WDE.PedalProfiler2
             Line(P("Engine settings", FormatEngineSettings(es, subTickSize)));
             Line(P("Graph", FormatGraphCounts(graph)));
             Line("");
+
+            // ── DEADLINE MISSES (v2.2) ──────────────────────────────────
+            // The deadline-referenced counter — the one dropout signal in this
+            // dump that is referenced to the real driver deadline rather than
+            // PP2's internal chunk budget, so ci= does not apply to it.
+            EmitDeadlineSection(Line, deadlineEvents);
 
             // ── PER-CHUNK TIMING ────────────────────────────────────────
             Line("── PER-CHUNK TIMING (p50/p90 trust; p99/max symptom, see caveats) ─");
@@ -3801,8 +3885,22 @@ namespace WDE.PedalProfiler2
                             Trunc(p.name, 30), p.type, "—", label));
                     }
                     else
-                        Line(string.Format("  {0,-30} {1,-5} {2,8:F2} {3,8:F3}",
-                            Trunc(p.name, 30), p.type, p.enginePct, p.msPerBuf));
+                    {
+                        string flag = p.mtNoisy
+                            ? $"   ⚑MT {p.msPerBuf / Math.Max(1e-6, p.siblingMedianMs):F0}× sibling median {p.siblingMedianMs:F3}"
+                            : "";
+                        Line(string.Format("  {0,-30} {1,-5} {2,8:F2} {3,8:F3}{4}",
+                            Trunc(p.name, 30), p.type, p.enginePct, p.msPerBuf, flag));
+                    }
+                }
+                if (mtOn)
+                {
+                    Line("  " + new string('─', 56));
+                    Line("  MT=ON: a single dump is NOT a cost ranking — any thread pause (preemption, GC) is");
+                    Line("  charged to whichever machine was mid-Work, and the ~1 s EMA keeps the latest victims.");
+                    Line("  Average several dumps, use Measure Marginal, or dump once with MT=OFF (MT findings 2026-11-10 §1).");
+                    if (mtNoisyCount > 0)
+                        Line($"  ⚑MT = ENGINE >{MtNoisyRatio:F0}× the median of same-DLL siblings (and >{MtNoisyFloorMs:F2} ms above it; siblings under {MtIdleFloorMs:F3} ms ignored as idle): {mtNoisyCount} row(s) — likely pause-charged, not real cost.");
                 }
             }
             else
@@ -3818,6 +3916,8 @@ namespace WDE.PedalProfiler2
                 : "last G2 not observed since PP2 loaded";
             Line(string.Format("  G0={0} ({1:F1}/s)  G1={2} ({3:F2}/s)  G2={4} ({5:F2}/s)  heap {6:F1} MB  {7}",
                 g0, _gcG0PerSec, g1, _gcG1PerSec, g2, _gcG2PerSec, heapMB, g2AgePhrase));
+            Line("  (per-second rates are a ~1 s EMA — useless for G2 at one per ~15 s; use the window line)");
+            EmitGcDetail(Line);
             Line("");
 
             // ── SPIKES ──────────────────────────────────────────────────
@@ -3896,10 +3996,13 @@ namespace WDE.PedalProfiler2
 
             // ── Trust-vs-artifact legend (always at foot) ───────────────
             Line("── LEGEND ──────────────────────────────────────────────────");
-            Line("  TRUST:  ears · OtherMs p50/p90 · per-machine ENGINE% · GC last-G2 age · Unaccounted%");
+            Line("  TRUST:  ears · DeadlineMissCount (rate / Δ over window) · OtherMs p50/p90 · GC last-G2 age · Unaccounted%");
+            Line("          per-machine ENGINE% — with MT=OFF, or averaged across dumps under MT=ON (⚑MT rows are pause-charged)");
             Line("  DISTRUST as audible-dropout proxies (all cadence-inflate together at driver:chunk > 3):");
             Line("     TotalDropouts%, WindowDropouts, overruns/s, OtherMs p99/max, PeakOtherMs");
             Line("     — internal-budget reference, not ASIO deadline (perf handoff §10, PP2 §9.5, §14.2)");
+            Line("  NOT A DROPOUT COUNTER: DriverResetCount = device catastrophic-reset tally (blind to ordinary underruns)");
+            Line("  NOTE:   Worst overrun = single high-water mark since host start/reset, not a typical value");
             Line("  LABEL:  AvgOtherMs / CpuPct = buffer-cycle utilisation (≈100% healthy AND saturated) — not CPU");
             Line("  LABEL:  p99 / max under FillThread=ON reflect fill-thread sleep gaps, not chunk cost (PP2 §14.2)");
             Line("  NOTE:   Overrun rate / SpikeRawTotal = per-cycle TALLY, NOT distinct large events");
@@ -4174,6 +4277,9 @@ namespace WDE.PedalProfiler2
             public bool   isNative;
             public bool   isUnavailable;
             public string statusTag;  // "ok"/"idle"/"warmup"  (for the "(idle)" vs "(warming up)" display)
+            public string dll;        // machine DLL name — "same type" for the MT-noisy check
+            public bool   mtNoisy;    // v2.2: ENGINE >5× median of same-DLL siblings under MT
+            public double siblingMedianMs;
         }
 
         // Walks all machines, reads the existing smoothed (ENGINE%, ms/buf) from
@@ -4238,12 +4344,14 @@ namespace WDE.PedalProfiler2
                         }
                     }
 
+                    string dll = "";
+                    try { dll = m.DLL?.Name ?? ""; } catch { }
                     rows.Add(new PerMachineRow {
                         name = m.Name, type = typeTag,
                         enginePct = enginePct, msPerBuf = msPerBuf,
                         isNative = false,
                         isUnavailable = statusTag != "ok",
-                        statusTag = statusTag });
+                        statusTag = statusTag, dll = dll });
                 }
             } catch { }
             // Sort: managed-cost rows desc, then unavailable, then native
@@ -4257,6 +4365,236 @@ namespace WDE.PedalProfiler2
             return rows;
         }
 
+        // ── v2.2: deadline-miss dump helpers ───────────────────────────────
+
+        // Trailing PP2 v3 group. na = this build has no DeadlineMissCount.
+        static string DeadlineGroup(DeadlineMonitor dl, int? mtNoisy)
+        {
+            string mt = mtNoisy.HasValue ? mtNoisy.Value.ToString() : "na";
+            if (!dl.Available)
+                return $"dmiss=na dwin=na drate=na dworst_us=na dhost=na dreset=na mtnoisy={mt} dep=na depr=na g2win=na gcpause=na alloc=na";
+            string dres = dl.DriverResets >= 0 ? dl.DriverResets.ToString() : "na";
+            return System.FormattableString.Invariant(
+                $"dmiss={dl.WindowMisses} dwin={dl.WindowSec:F1} drate={dl.WindowRate:F3}/s dworst_us={dl.WorstUs} dhost={dl.HostCount} dreset={dres} mtnoisy={mt} dep={dl.Episodes} depr={dl.EpisodeRate:F3}/s g2win={dl.WindowG2} gcpause={Na(dl.WindowPausePct, "F1")} alloc={Na(dl.WindowAllocMBps, "F1")}");
+            static string Na(double v, string f) => double.IsNaN(v) ? "na" : v.ToString(f, System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        void EmitDeadlineSection(Action<string> Line, MissEvent[] evs)
+        {
+            var dl = _deadline;
+            Line("── DEADLINE MISSES (driver callback deadline — TRUST; not cadence-inflated) ─");
+            if (!dl.Available)
+            {
+                Line(P("DeadlineMissCount", "n/a",
+                       "[this ReBuzz build has no DeadlineMissCount — only the budget-relative family below is available]"));
+                Line("");
+                return;
+            }
+
+            string hostScope = dl.BaselineAfterHostReset
+                ? $"[since counter reset {dl.BaselineWall:HH:mm:ss}]"
+                : "[since process start]";
+            Line(P("DeadlineMissCount (host)", $"{dl.HostCount}", hostScope));
+
+            double w = dl.WindowSec, r = dl.WindowRate;
+            long n = dl.WindowMisses;
+            string every = (n > 0 && w > 5) ? $"  (≈ 1 / {w / n:F1} s)" : "";
+            Line(P("Misses in PP2 window",
+                   $"{n} in {w:F1} s = {r:F3}/s{every}",
+                   $"[baseline: {dl.BaselineReason} {dl.BaselineWall:HH:mm:ss}]"));
+            var (n60, sat60) = dl.MissesInLast(60);
+            Line(P("Misses in last 60 s", $"{(sat60 ? "≥" : "")}{n60}"));
+            string worstScope = dl.BaselineAfterHostReset
+                ? "[high-water since reset — not per-event]"
+                : "[high-water since process start — not per-event; Reset miss counters to scope it]";
+            Line(P("Worst overrun", dl.WorstUs > 0 ? $"{dl.WorstUs / 1000.0:F1} ms" : "0", worstScope));
+            Line(P("Device resets (DriverResetCount)",
+                   dl.DriverResets >= 0 ? dl.DriverResets.ToString() : "n/a",
+                   "[catastrophic device-reset tally — NOT a dropout counter]"));
+            Line(P("Reference", "each driver callback vs its own block (frames / sampleRate)",
+                   "[live transport only; 1 s warm-up after provider start]"));
+            if (dl.ExternalHostResets > 0)
+                Line(P("  ↳ note", $"host counters were reset externally {dl.ExternalHostResets}×; window restarted"));
+            Line(P("  ↳ ears", "final arbiter — counter is a conservative superset of audible dropouts"));
+
+            if (evs.Length == 0)
+            {
+                Line("  miss log: (none in this window)");
+                Line("");
+                return;
+            }
+
+            // Miss log, newest first.
+            int show = Math.Min(evs.Length, 32);
+            Line("");
+            Line($"  Miss log (newest first; {show} of {dl.LoggedEvents} logged this window, ring {DeadlineMonitor.RingSize}):");
+            Line(string.Format("  {0,3} {1,-8} {2,8} {3,7} {4,3} {5,2} {6,5} {7,-24} {8,6} {9,7} {10,7} {11,7} {12,9}",
+                "#", "wall", "t(s)", "Δprev", "ep", "n", "pos", "patpos/len (machine)", "@start", "G1ago", "G2ago", "gcPause", "worst(ms)"));
+            for (int i = 0; i < show; i++)
+            {
+                var e = evs[i];
+                string dprev = (i + 1 < evs.Length) ? $"{e.TSec - evs[i + 1].TSec:F2}" : "—";
+                var c = e.Song;
+                string pos = c.Valid ? c.SongPos.ToString() : "?";
+                string pat = (c.Valid && c.PatPos >= 0)
+                    ? Trunc($"{c.PatPos}/{c.PatLen} ({c.PatMachine})", 24)
+                    : (c.Valid && !c.Playing ? "(stopped)" : "—");
+                string atStart = (c.Valid && c.PatPos >= 0) ? $"{c.SeqsNearStart}/{c.SeqsPlaying}" : "—";
+                string ep = e.Onset ? $"{e.Episode}" : "·";
+                string g1 = e.Gc.MsSinceG1 < 0 ? "—" : AgoMs(e.Gc.MsSinceG1);
+                string g2 = e.Gc.MsSinceG2 < 0 ? "—" : AgoMs(e.Gc.MsSinceG2);
+                string gp = double.IsNaN(e.Gc.PauseMs) ? "n/a" : $"{e.Gc.PauseMs:F1}";
+                string worst = e.WorstRaised ? $"{e.WorstUs / 1000.0:F1}*" : $"≤{e.WorstUs / 1000.0:F1}";
+                Line(string.Format("  {0,3} {1,-8} {2,8:F2} {3,7} {4,3} {5,2} {6,5} {7,-24} {8,6} {9,7} {10,7} {11,7} {12,9}",
+                    i, e.Wall.ToString("HH:mm:ss"), e.TSec, dprev, ep, e.Batch, pos, pat, atStart, g1, g2, gp, worst));
+            }
+            Line($"  (ep = episode number on its first miss, · = follow-on miss within {DeadlineMonitor.EpisodeGapSec:F1} s (catch-up overruns);");
+            Line("   pos = song tick; patpos = ticks since the latest pattern start in any non-Master sequence;");
+            Line("   @start = such sequences within tolerance of their pattern start; G1ago/G2ago = time since the last");
+            Line($"   observed gen-1 / gen-2 collection (≤20 ms late); gcPause = GC pause ms in the {DeadlineMonitor.LookbackMs:F0} ms before detection;");
+            Line("   worst* = this miss raised the high-water mark, so ≈ its own overrun)");
+
+            // Summaries / hypothesis tests — on episode onsets (bursts aren't independent).
+            var onsets = MissAnalysis.Onsets(evs);
+            Line("");
+            Line(P("episodes", $"{dl.Episodes} in {w:F1} s = {dl.EpisodeRate:F3}/s",
+                   $"[{n} misses → {(dl.Episodes > 0 ? (double)n / dl.Episodes : 0):F1} per episode; tests below use onsets only]"));
+            var iv = MissAnalysis.Intervals(onsets);
+            if (iv.n > 0)
+            {
+                double loopTicks = 0, tps = 0;
+                var c0 = onsets[0].Song;
+                if (c0.Valid && c0.Bpm > 0 && c0.Tpb > 0) { tps = c0.Bpm * c0.Tpb / 60.0; loopTicks = c0.LoopEnd - c0.LoopStart; }
+                string loopNote = (tps > 0 && loopTicks > 0) ? $"  [loop = {loopTicks / tps:F2} s]" : "";
+                Line(P("onset intervals", $"n={iv.n}  mean={iv.meanS:F2} s  σ={iv.sdS:F2} s  CV={iv.cv:F2}",
+                       $"(min {iv.minS:F2} · max {iv.maxS:F2} s){loopNote}{(iv.cv < 0.15 && iv.n >= 4 ? "  → periodic" : "")}"));
+            }
+
+            void Test(string name, MissAnalysis.Proportion pr, string what, string extra = "")
+            {
+                if (pr.n == 0) { Line(P(name, "no usable onsets")); return; }
+                if (pr.ctlN < 20 || double.IsNaN(pr.ctlFrac))
+                {
+                    Line(P(name, $"{pr.hits}/{pr.n} {what}", $"[control too small: {pr.ctlN} samples — keep playing]{extra}"));
+                    return;
+                }
+                string verdict = pr.n < 5 ? "too few onsets to judge"
+                               : pr.p < 0.01 ? "IMPLICATED"
+                               : pr.p < 0.05 ? "weak evidence"
+                               : "no association detected";
+                Line(P(name, $"{pr.hits}/{pr.n} {what} vs {pr.ctlFrac * 100:F1}% at random (exp {pr.ctlFrac * pr.n:F1})",
+                       $"p={pr.p:G2} → {verdict}  [control n={pr.ctlN}]{extra}"));
+            }
+
+            var ph = MissAnalysis.PatternPhase(onsets, dl.CtlPhaseN, dl.CtlPhaseNear, out int tol);
+            Test("pattern-boundary test", ph, $"within ≤{tol} tick(s) of a pattern start");
+            var g2t = MissAnalysis.NearG2(onsets, dl.CtlGcN, dl.CtlNearG2);
+            Test("G2-before test", g2t, $"had a G2 ≤{DeadlineMonitor.NearG2Ms:F0} ms before");
+            double pThr = dl.CtlPauseQuantile(DeadlineMonitor.PauseCtlQuantile);
+            if (!double.IsNaN(pThr))
+            {
+                var pt = MissAnalysis.PauseHit(onsets, pThr, dl.CtlPauseN, dl.CtlPauseAbove(pThr), out double meanPause);
+                double ctlMean = dl.CtlGcN > 0 ? dl.CtlPauseSumMs / dl.CtlGcN : double.NaN;
+                Test("GC-pause test", pt,
+                     $"had >{pThr:F0} ms GC pause in the prior {DeadlineMonitor.LookbackMs:F0} ms (control p{DeadlineMonitor.PauseCtlQuantile * 100:F0})",
+                     $"  mean pause {meanPause:F1} ms vs {ctlMean:F1} ms at random");
+            }
+            else if (onsets.Length > 0 && !double.IsNaN(onsets[0].Gc.PauseMs))
+                Line(P("GC-pause test", "waiting for control samples"));
+            else
+                Line(P("GC-pause test", "n/a", "[GC.GetTotalPauseDuration unavailable]"));
+            Line("");
+        }
+
+        // ── v2.2.2: GC detail for the dump ─────────────────────────────────
+        void EmitGcDetail(Action<string> Line)
+        {
+            var dl = _deadline;
+            double w = dl.WindowSec;
+            if (w >= 1)
+            {
+                int g2w = dl.WindowG2;
+                string every = g2w > 0 ? $" (every {w / g2w:F1} s)" : "";
+                double pp = dl.WindowPausePct, al = dl.WindowAllocMBps;
+                Line(P("miss window", $"{w:F1} s: G2 ×{g2w}{every} · GC pause {(double.IsNaN(pp) ? "n/a" : pp.ToString("F1") + "% of wall time")} · alloc {(double.IsNaN(al) ? "n/a" : al.ToString("F1") + " MB/s")}",
+                       $"[since {dl.BaselineReason} {dl.BaselineWall:HH:mm:ss}]"));
+            }
+            try
+            {
+                string conc = "?";
+                try { var v = AppContext.GetData("System.GC.Concurrent"); conc = v == null ? "default(ON)" : v.ToString() ?? "?"; } catch { }
+                var any = GC.GetGCMemoryInfo(GCKind.Any);
+                Line(P("GC mode", $"Server={System.Runtime.GCSettings.IsServerGC}  Concurrent={conc}  LatencyMode={System.Runtime.GCSettings.LatencyMode}",
+                       $"[process pause-time {any.PauseTimePercentage:F1}% since start]"));
+                void Kind(string label, GCKind k)
+                {
+                    var mi = GC.GetGCMemoryInfo(k);
+                    if (mi.Index == 0) { Line(P(label, "none yet")); return; }
+                    var ps = mi.PauseDurations;
+                    var sb = new System.Text.StringBuilder();
+                    for (int i = 0; i < ps.Length; i++) { if (ps[i] == TimeSpan.Zero) continue; if (sb.Length > 0) sb.Append(" + "); sb.Append(ps[i].TotalMilliseconds.ToString("F1")); }
+                    Line(P(label, $"#{mi.Index} gen{mi.Generation}  pause {(sb.Length > 0 ? sb.ToString() : "0")} ms  compacted={mi.Compacted}",
+                           $"heap {mi.HeapSizeBytes / 1048576.0:F0} MB · promoted {mi.PromotedBytes / 1048576.0:F1} MB · fragmented {mi.FragmentedBytes / 1048576.0:F0} MB"));
+                }
+                Kind("last ephemeral GC", GCKind.Ephemeral);
+                Kind("last background GC", GCKind.Background);
+                Kind("last full blocking GC", GCKind.FullBlocking);
+            }
+            catch (Exception ex) { Line(P("GC detail", $"unavailable ({ex.GetType().Name})")); }
+        }
+
+        static string AgoMs(double ms) => ms < 1000 ? $"{ms:F0}ms" : ms < 100000 ? $"{ms / 1000:F1}s" : ">99s";
+
+        // ── v2.2: per-machine "noisy under MT" flag ─────────────────────────
+        const double MtNoisyRatio   = 5.0;    // × median of same-DLL siblings
+        const double MtNoisyFloorMs = 0.05;   // and at least this far above it
+        const double MtIdleFloorMs  = 0.005;  // siblings below this are treated as idle, not compared
+
+        // Flags rows whose ms/buf is > MtNoisyRatio × the median of their same-DLL
+        // siblings (and > MtNoisyFloorMs above it). Only under MT=ON: with MT off
+        // an outlier is more likely a real difference (settings, voices). Returns
+        // the flagged count (0 when MT is off).
+        static int FlagNoisyUnderMt(List<PerMachineRow> rows, bool mtOn)
+        {
+            if (!mtOn) return 0;
+            int flagged = 0;
+            var groups = new Dictionary<string, List<int>>();
+            for (int i = 0; i < rows.Count; i++)
+            {
+                var r = rows[i];
+                if (r.isNative || r.isUnavailable || double.IsNaN(r.msPerBuf) || string.IsNullOrEmpty(r.dll)) continue;
+                if (!groups.TryGetValue(r.dll, out var l)) groups[r.dll] = l = new List<int>();
+                l.Add(i);
+            }
+            foreach (var idx in groups.Values)
+            {
+                if (idx.Count < 2) continue;
+                foreach (int i in idx)
+                {
+                    var others = new List<double>(idx.Count - 1);
+                    // v2.2.1: ignore near-idle siblings (silent input / unused
+                    // instances) — they drag the median to ~0 and made every
+                    // working instance look noisy (050: Matrix_*_FX at 0.002).
+                    foreach (int j in idx)
+                        if (j != i && rows[j].msPerBuf >= MtIdleFloorMs) others.Add(rows[j].msPerBuf);
+                    if (others.Count == 0) continue;
+                    others.Sort();
+                    int m = others.Count;
+                    double med = (m % 2 == 1) ? others[m / 2] : 0.5 * (others[m / 2 - 1] + others[m / 2]);
+                    double v = rows[i].msPerBuf;
+                    if (v > MtNoisyRatio * med && v - med > MtNoisyFloorMs)
+                    {
+                        var r = rows[i];
+                        r.mtNoisy = true;
+                        r.siblingMedianMs = med;
+                        rows[i] = r;
+                        flagged++;
+                    }
+                }
+            }
+            return flagged;
+        }
+
         static string BuildMachineLine(
             string version, double t, double chunkMs,
             double p50, double p90, double p99, double max,
@@ -4267,7 +4605,8 @@ namespace WDE.PedalProfiler2
             GraphCounts graph,
             int? asioBufSmp, int chunkSmp, double? ratio,
             bool cadenceInflated, int? audioThreads,
-            long qpcHz)
+            long qpcHz,
+            DeadlineMonitor dl, int? mtNoisy)
         {
             string asio  = asioBufSmp.HasValue ? asioBufSmp.Value.ToString() : "unknown";
             string ratioS = ratio.HasValue ? $"{ratio.Value:F2}" : "na";
@@ -4285,7 +4624,8 @@ namespace WDE.PedalProfiler2
                    $"play={(play ? 1 : 0)} bpm={bpm} | " +
                    $"mach={graph.total}(a{graph.active} m{graph.muted} b{graph.bypassed} s{graph.soloed} c{graph.control} n{graph.native}) | " +
                    $"asio={asio} chunk_smp={chunkSmp} ratio={ratioS} athreads={ath} | " +
-                   $"qpc={qpcHz}";
+                   $"qpc={qpcHz} | " +
+                   DeadlineGroup(dl, mtNoisy);
         }
 
         // Reflection helpers — best-effort public-property and private-field access
