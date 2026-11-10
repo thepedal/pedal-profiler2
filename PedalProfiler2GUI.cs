@@ -90,6 +90,11 @@ namespace WDE.PedalProfiler2
 
         // ─── Deadline-miss monitor (v2.2) — shared by footer, dump, FR auto-mark ─
         readonly DeadlineMonitor _deadline = new();
+        // ─── Allocation sampler (v2.3.0) — EventListener on GCAllocationTick ──
+        readonly AllocSampler _alloc = new();
+        long       _uiOsTid;
+        CheckBox?  _allocCheckbox;
+        TextBlock? _allocStatus;
         int _phaseSampleTick;          // ~2 Hz pattern-phase control sampling
         TextBlock? _missResetStatus;
 
@@ -613,6 +618,7 @@ namespace WDE.PedalProfiler2
             Height     = 780;
 
             BuildUI();
+            _uiOsTid = OsThread.Id();
 
             _timer = new DispatcherTimer(DispatcherPriority.Render)
             {
@@ -632,6 +638,7 @@ namespace WDE.PedalProfiler2
 
             Unloaded += (_, __) =>
             {
+                try { _alloc.Stop(); if (_allocCheckbox != null) _allocCheckbox.IsChecked = false; } catch { }
                 _timer.Stop();
                 _frCostTimer?.Stop();
                 _measureTimer?.Stop();
@@ -1167,6 +1174,35 @@ namespace WDE.PedalProfiler2
             missRow.Children.Add(_missResetStatus);
             root.Children.Add(missRow);
 
+            // Allocation sampler (v2.3.0). Off by default. While on, the runtime
+            // reports a GCAllocationTick roughly every 100 KB allocated, with the
+            // type and OS thread — the dump's ALLOCATIONS section ranks both.
+            var allocRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+            _allocCheckbox = new CheckBox
+            {
+                Content    = "Sample allocations (who / what allocates)",
+                Foreground = BrushText,
+                FontFamily = Mono,
+                FontSize   = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                IsChecked  = false
+            };
+            _allocCheckbox.Checked   += (_, __) => { _alloc.Start(); UpdateAllocStatus(); };
+            _allocCheckbox.Unchecked += (_, __) => { _alloc.Stop();  UpdateAllocStatus(); };
+            allocRow.Children.Add(_allocCheckbox);
+            _allocStatus = new TextBlock
+            {
+                Text       = "off — tick, play 30 s+, then Dump",
+                Foreground = BrushSubText,
+                FontFamily = Mono,
+                FontSize   = 10,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextWrapping = TextWrapping.Wrap,
+                Margin     = new Thickness(8, 0, 0, 0)
+            };
+            allocRow.Children.Add(_allocStatus);
+            root.Children.Add(allocRow);
+
             // ── Flight Recorder (opt-in glitch capture) ──────────────────────
             root.Children.Add(SectionHeader("Flight Recorder"));
             var frRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 4) };
@@ -1472,6 +1508,7 @@ namespace WDE.PedalProfiler2
             RefreshActivity();
             RefreshMasterOutput();
             RefreshGlobalStatus(snap);
+            if (_alloc.Enabled) UpdateAllocStatus();
             UpdateSweep(snap);
             DrawSparkline();
         }
@@ -3920,6 +3957,9 @@ namespace WDE.PedalProfiler2
             EmitGcDetail(Line);
             Line("");
 
+            // ── ALLOCATIONS (v2.3.0) ────────────────────────────────────
+            EmitAllocations(Line, audioThreads);
+
             // ── SPIKES ──────────────────────────────────────────────────
             Line("── SPIKES (recorded ring, full ActiveMachines, uncapped attribution) ─");
             Line(string.Format("  rate {0:F1}/s  (recorded list capped at 1 / 0.5 s — intervals NOT meaningful, §6.4)", rate));
@@ -4541,6 +4581,77 @@ namespace WDE.PedalProfiler2
                 Kind("last full blocking GC", GCKind.FullBlocking);
             }
             catch (Exception ex) { Line(P("GC detail", $"unavailable ({ex.GetType().Name})")); }
+        }
+
+        // ── v2.3.0: allocation sampler UI + dump ───────────────────────────
+        string ThreadLabel(long tid)
+        {
+            if (tid != 0 && tid == _uiOsTid) return "UI thread (WPF dispatcher)";
+            long wt = _machine?.WorkOsThreadId ?? 0;
+            if (tid != 0 && tid == wt) return "engine/fill thread (runs PP2 Work)";
+            if (tid != 0 && tid == _alloc.SelfTid) return "PP2 sampler (event dispatch — own overhead)";
+            return $"tid {tid}";
+        }
+
+        void UpdateAllocStatus()
+        {
+            if (_allocStatus == null) return;
+            if (!_alloc.Enabled) { _allocStatus.Text = "off"; _allocStatus.Foreground = BrushSubText; return; }
+            var r = _alloc.Snapshot(1, 1, 1);
+            if (r.Ticks == 0)
+            {
+                _allocStatus.Text = _alloc.SourceSeen ? "on — waiting for allocation ticks…" : "on — runtime event source not seen yet";
+                _allocStatus.Foreground = BrushWarn;
+                return;
+            }
+            string top = r.Types.Count > 0 ? $"{Trunc(r.Types[0].type, 28)} {r.Types[0].bytes * 100.0 / r.TotalBytes:F0}%" : "";
+            string thr = r.Threads.Count > 0 ? $"{Trunc(ThreadLabel(r.Threads[0].tid), 24)} {r.Threads[0].bytes * 100.0 / r.TotalBytes:F0}%" : "";
+            _allocStatus.Text = $"{r.MBps(r.TotalBytes):F0} MB/s over {r.Seconds:F0} s · top type {top} · top thread {thr}";
+            _allocStatus.Foreground = BrushOk;
+        }
+
+        void EmitAllocations(Action<string> Line, int? audioThreads)
+        {
+            Line("── ALLOCATIONS (GCAllocationTick sampling — who / what allocates) ─");
+            if (!_alloc.Enabled && _alloc.Snapshot(1, 1, 1).Ticks == 0)
+            {
+                Line("  (sampler off — tick \"Sample allocations\" in Diagnostics, play 30 s+, then dump)");
+                Line("");
+                return;
+            }
+            var r = _alloc.Snapshot(15, 8, 4);
+            if (r.Ticks == 0) { Line("  (no allocation ticks yet)"); Line(""); return; }
+            Line(P("sampled", $"{r.MBps(r.TotalBytes):F1} MB/s over {r.Seconds:F1} s ({r.Ticks} ticks ≈ 1 per 100 KB)",
+                   $"large-object {r.MBps(r.LargeBytes):F1} MB/s · pinned {r.MBps(r.PinnedBytes):F1} MB/s{(_alloc.Enabled ? "" : "  [sampler now OFF — totals frozen]")}"));
+            Line("");
+            Line(string.Format("  {0,-56} {1,8} {2,6} {3,7}", "type (the object that crossed each 100 KB tick)", "MB/s", "%", "ticks"));
+            foreach (var t in r.Types)
+                Line(string.Format("  {0,-56} {1,8:F1} {2,5:F1}% {3,7}", Trunc(t.type, 56), r.MBps(t.bytes), t.bytes * 100.0 / r.TotalBytes, t.n));
+            Line("");
+            Line(string.Format("  {0,-46} {1,8} {2,6}   {3}", "thread", "MB/s", "%", "top types"));
+            foreach (var th in r.Threads)
+            {
+                var sb = new System.Text.StringBuilder();
+                foreach (var (type, bytes) in th.top)
+                {
+                    if (sb.Length > 0) sb.Append(" · ");
+                    sb.Append($"{ShortTypeName(type)} {bytes * 100.0 / Math.Max(1, th.bytes):F0}%");
+                }
+                Line(string.Format("  {0,-46} {1,8:F1} {2,5:F1}%   {3}", Trunc(ThreadLabel(th.tid), 46), r.MBps(th.bytes), th.bytes * 100.0 / r.TotalBytes, sb));
+            }
+            Line($"  (MT worker threads — AudioThreads={(audioThreads?.ToString() ?? "?")} — show as unlabelled tids with similar amounts;");
+            Line("   a type is tick-sampled: proportions are reliable over tens of seconds, single small entries are noise)");
+            Line("");
+        }
+
+        static string ShortTypeName(string t)
+        {
+            if (string.IsNullOrEmpty(t)) return "?";
+            int gen = t.IndexOf('[');
+            string head = gen > 0 && !t.EndsWith("[]") ? t.Substring(0, gen) : t;
+            int dot = head.LastIndexOf('.');
+            string shortName = dot >= 0 ? head.Substring(dot + 1) : head;
+            return Trunc(shortName, 28);
         }
 
         static string AgoMs(double ms) => ms < 1000 ? $"{ms:F0}ms" : ms < 100000 ? $"{ms / 1000:F1}s" : ">99s";

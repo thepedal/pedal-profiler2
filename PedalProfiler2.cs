@@ -88,7 +88,7 @@ namespace WDE.PedalProfiler2
         // ─── Version (single source of truth) ────────────────────────────────
         // Referenced from the reflection dump header and the About window.
         // Keeps the dump, About dialog, and git tag from drifting apart.
-        internal const string Version = "2.2.2";
+        internal const string Version = "2.3.1";
 
 
         // ─── ReBuzz context menu — About entry ───────────────────────────────
@@ -432,9 +432,16 @@ namespace WDE.PedalProfiler2
 
 
         // ─── Work() — audio thread, called every buffer, BEFORE generators ──
+        // OS id of the thread that runs Work() (the engine/fill thread), so the
+        // allocation sampler can label it. v2.3.1: refreshed every call — 2.3.0
+        // captured it once, and the first Work() can come from another thread
+        // (load/warm-up), so the label never matched on 050.
+        public long WorkOsThreadId;
+
         public void Work()
         {
             long nowTicks = Stopwatch.GetTimestamp();
+            WorkOsThreadId = OsThread.Id();   // kernel32 GetCurrentThreadId: TEB read, ~ns
 
             // Cache sample rate from MasterInfo (valid inside Work()).
             // Atomic int write — UI thread reads safely.

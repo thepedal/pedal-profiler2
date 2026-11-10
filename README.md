@@ -119,6 +119,16 @@ is now PP2's primary dropout signal:
 The worst overrun is a single high-water mark since ReBuzz started or since the last
 reset — press **Reset miss counters** before a measurement leg to scope it.
 
+## Allocation sampler (v2.3.0)
+
+Tick **Sample allocations** in Diagnostics, play 30 s or more, then Dump. PP2 listens to
+the runtime's own `GCAllocationTick` events (one per ~100 KB allocated on a thread) via an
+in-process `EventListener` and adds an `ALLOCATIONS` section to the dump: MB/s overall,
+the top allocated types, and the top threads (labelled UI thread, engine/fill thread,
+PP2's own sampler; MT worker threads appear as plain tids) with each thread's top types.
+No external tools or ReBuzz changes. It's sampled — proportions are reliable over tens of
+seconds — and off by default; the status line next to the checkbox shows live MB/s.
+
 ## Per-machine cost under multithreading (v2.2.0)
 
 With MT on, ReBuzz's per-machine stopwatch brackets the whole work call, so any thread
